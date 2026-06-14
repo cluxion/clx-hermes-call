@@ -98,6 +98,36 @@ def cleanup_created_session(
     expected_cwd: str | Path | None = None,
 ) -> SessionCleanupReport:
     """Delete exactly one newly-created session, refusing ambiguous diffs."""
+    report = identify_created_session(
+        before,
+        after,
+        hermes_bin=hermes_bin,
+        runner=runner,
+        expected_cwd=expected_cwd,
+    )
+    if report.session_id is None:
+        return report
+
+    deleted = delete_session(report.session_id, hermes_bin=hermes_bin, runner=runner)
+    if deleted.cleaned:
+        return SessionCleanupReport(cleaned=True, session_id=report.session_id, model=report.model)
+    return SessionCleanupReport(
+        cleaned=False,
+        reason=deleted.reason,
+        session_id=report.session_id,
+        model=report.model,
+    )
+
+
+def identify_created_session(
+    before: SessionSnapshot,
+    after: SessionSnapshot,
+    *,
+    hermes_bin: str = "hermes",
+    runner: CommandRunner = default_runner,
+    expected_cwd: str | Path | None = None,
+) -> SessionCleanupReport:
+    """Identify exactly one newly-created session without deleting it."""
     if not before.ok:
         return SessionCleanupReport(cleaned=False, reason=f"before_list_failed:{before.error or 'unknown'}")
     if not after.ok:
@@ -126,15 +156,24 @@ def cleanup_created_session(
         session_id = new_ids[0]
         model = fetch_session_model(session_id, hermes_bin=hermes_bin, runner=runner)
 
+    return SessionCleanupReport(cleaned=False, reason=None, session_id=session_id, model=model)
+
+
+def delete_session(
+    session_id: str,
+    *,
+    hermes_bin: str = "hermes",
+    runner: CommandRunner = default_runner,
+) -> SessionCleanupReport:
+    """Delete a known Hermes session id through the verified CLI command."""
     completed = _run_session_command([hermes_bin, "sessions", "delete", "--yes", session_id], runner=runner)
     combined_output = f"{completed.stdout}\n{completed.stderr}"
     if completed.returncode == 0 and f"Deleted session '{session_id}'" in combined_output:
-        return SessionCleanupReport(cleaned=True, session_id=session_id, model=model)
+        return SessionCleanupReport(cleaned=True, session_id=session_id)
     return SessionCleanupReport(
         cleaned=False,
         reason=f"delete_failed:{_short_error(combined_output or f'exit {completed.returncode}')}",
         session_id=session_id,
-        model=model,
     )
 
 

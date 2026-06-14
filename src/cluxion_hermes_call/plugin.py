@@ -7,6 +7,7 @@ import sys
 
 from cluxion_hermes_call import __version__
 from cluxion_hermes_call.cli import add_call_arguments, options_from_namespace
+from cluxion_hermes_call.config import default_model_help_line
 from cluxion_hermes_call.core import run_call
 from cluxion_hermes_call.doctor import run_doctor, write_doctor_result
 from cluxion_hermes_call.jobs import gc_jobs
@@ -27,6 +28,7 @@ def register(ctx: object) -> None:
 
 
 def _setup_call_parser(parser: argparse.ArgumentParser) -> None:
+    parser.epilog = default_model_help_line()
     add_call_arguments(parser)
     parser.add_argument("--live", action="store_true", help="With `doctor`, run one tiny live --ask round-trip")
 

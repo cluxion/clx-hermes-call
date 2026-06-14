@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TextIO
 
 from cluxion_hermes_call import __version__
+from cluxion_hermes_call.config import default_model_help_line
 from cluxion_hermes_call.core import CallOptions, CallResult, run_call
 from cluxion_hermes_call.doctor import run_doctor, write_doctor_result
 from cluxion_hermes_call.jobs import gc_jobs
@@ -18,11 +19,14 @@ def add_call_arguments(parser: argparse.ArgumentParser) -> None:
     """Attach hermes-call invocation flags to an argparse parser."""
     parser.add_argument("prompt", nargs="?", metavar="PROMPT", help="Prompt text, or '-' to read from stdin")
     parser.add_argument("-p", "--prompt", dest="prompt_alias", help="Prompt text alias")
+    parser.add_argument("-m", "--model", help="Per-run Hermes model override passed to hermes -m")
     parser.add_argument("--ask", action="store_true", help="Answer-only mode using the verified no-tool toolset")
     parser.add_argument("-C", "--cd", dest="cwd", help="Run hermes with this subprocess working directory")
     parser.add_argument("--sandbox", action="store_true", help="Run in a fresh ~/.cluxion_hermes job work directory")
     parser.add_argument("--json", action="store_true", help="Print one JSON result object to stdout")
     parser.add_argument("--timeout", type=float, default=600.0, help="Timeout in seconds (default: 600)")
+    parser.add_argument("--until-done", action="store_true", help="Resume the owned Hermes session until TASK_COMPLETE")
+    parser.add_argument("--max-iterations", type=int, default=8, help="Maximum --until-done turns (default: 8)")
     parser.add_argument("--keep-session", action="store_true", help="Skip session self-cleanup")
     parser.add_argument("--keep", action="store_true", help="Keep the sandbox job directory")
     parser.add_argument("--toolsets", help="Advanced passthrough to hermes -t/--toolsets")
@@ -31,7 +35,7 @@ def add_call_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_call_parser(prog: str = "hermes-call") -> argparse.ArgumentParser:
     """Build the main hermes-call parser."""
-    parser = argparse.ArgumentParser(prog=prog)
+    parser = argparse.ArgumentParser(prog=prog, epilog=default_model_help_line())
     add_call_arguments(parser)
     return parser
 
@@ -121,6 +125,8 @@ def options_from_namespace(
     prompt = _resolve_prompt(ns.prompt, ns.prompt_alias, stdin=stdin, parser=parser)
     if ns.timeout <= 0:
         parser.error("--timeout must be greater than 0")
+    if ns.max_iterations <= 0:
+        parser.error("--max-iterations must be greater than 0")
     if ns.keep and not ns.sandbox:
         parser.error("--keep requires --sandbox")
     if ns.cwd and ns.sandbox:
@@ -139,6 +145,9 @@ def options_from_namespace(
         keep_session=bool(ns.keep_session),
         keep_job=bool(ns.keep),
         toolsets=ns.toolsets,
+        model=ns.model,
+        until_done=bool(ns.until_done),
+        max_iterations=int(ns.max_iterations),
     )
 
 

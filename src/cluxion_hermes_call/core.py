@@ -17,9 +17,21 @@ from cluxion_hermes_call.sessions import (
     SessionSnapshot,
     capture_session_ids,
     cleanup_created_session,
+    delete_session,
+    identify_created_session,
 )
 
 ASK_TOOLSETS = "context_engine"
+TASK_COMPLETE_MARKER = "TASK_COMPLETE"
+WORK_REMAINS_PREFIX = "WORK_REMAINS:"
+COMPLETION_CONTRACT = """
+
+---
+Completion contract for hermes-call --until-done:
+End your reply with a final line exactly `TASK_COMPLETE` when the task is fully done.
+If any work remains, end your reply with a final line `WORK_REMAINS: <what remains>`.
+Do not use either marker except as the final line.
+""".rstrip()
 SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)(\S+)"),
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
@@ -39,6 +51,9 @@ class CallOptions:
     keep_session: bool = False
     keep_job: bool = False
     toolsets: str | None = None
+    model: str | None = None
+    until_done: bool = False
+    max_iterations: int = 8
     hermes_bin: str = "hermes"
 
 
@@ -66,6 +81,10 @@ class CallResult:
     session_id: str | None = None
     job_dir: str | None = None
     job_deleted: bool | None = None
+    status: str | None = None
+    iterations: int | None = None
+    work_log: tuple[str, ...] = ()
+    last_work_remains: str | None = None
 
     def to_json_object(self) -> dict[str, object]:
         """Return the stable JSON result object."""
@@ -79,11 +98,24 @@ class CallResult:
         }
         if not self.session_cleaned and self.session_cleanup_reason is not None:
             payload["session_cleanup_reason"] = self.session_cleanup_reason
+        if self.status is not None:
+            payload["status"] = self.status
+        if self.iterations is not None:
+            payload["iterations"] = self.iterations
+        if self.status is not None and self.session_id is not None:
+            payload["session_id"] = self.session_id
+        if self.work_log:
+            payload["work_log"] = list(self.work_log)
+        if self.last_work_remains is not None:
+            payload["last_work_remains"] = self.last_work_remains
         return payload
 
 
 def run_call(options: CallOptions) -> CallResult:
     """Run Hermes once, clean up its session and sandbox when safe."""
+    if options.until_done:
+        return _run_until_done_call(options)
+
     start = time.monotonic()
     job: Job | None = None
     cwd = options.cwd
@@ -144,7 +176,21 @@ def run_call(options: CallOptions) -> CallResult:
 
 
 def _run_hermes_process(options: CallOptions, *, cwd: Path) -> HermesProcessResult:
-    command = _build_hermes_command(options)
+    return _run_hermes_process_with_prompt(options, cwd=cwd, prompt=options.prompt)
+
+
+def _run_hermes_process_with_prompt(
+    options: CallOptions,
+    *,
+    cwd: Path,
+    prompt: str,
+    resume_session_id: str | None = None,
+    timeout_seconds: float | None = None,
+) -> HermesProcessResult:
+    timeout = options.timeout_seconds if timeout_seconds is None else timeout_seconds
+    if timeout <= 0:
+        return HermesProcessResult(stdout="", stderr="overall timeout exceeded", returncode=124, timed_out=True)
+    command = _build_hermes_command(options, prompt=prompt, resume_session_id=resume_session_id)
     try:
         process = subprocess.Popen(
             command,
@@ -159,15 +205,37 @@ def _run_hermes_process(options: CallOptions, *, cwd: Path) -> HermesProcessResu
         return HermesProcessResult(stdout="", stderr=f"failed to start hermes: {exc}", returncode=1, timed_out=False)
 
     try:
-        stdout, stderr = process.communicate(timeout=options.timeout_seconds)
+        stdout, stderr = process.communicate(timeout=timeout)
+        if resume_session_id is not None:
+            stdout = _strip_chat_query_preamble(stdout)
         return HermesProcessResult(stdout=stdout, stderr=stderr, returncode=process.returncode or 0, timed_out=False)
     except subprocess.TimeoutExpired:
         stdout, stderr = _terminate_process_group(process)
+        if resume_session_id is not None:
+            stdout = _strip_chat_query_preamble(stdout)
         return HermesProcessResult(stdout=stdout, stderr=stderr, returncode=124, timed_out=True)
 
 
-def _build_hermes_command(options: CallOptions) -> list[str]:
-    command = [options.hermes_bin, "-z", options.prompt]
+def _build_hermes_command(
+    options: CallOptions,
+    *,
+    prompt: str | None = None,
+    resume_session_id: str | None = None,
+) -> list[str]:
+    actual_prompt = options.prompt if prompt is None else prompt
+    if resume_session_id is not None:
+        command = [options.hermes_bin, "chat", "-Q", "--resume", resume_session_id]
+        if options.ask:
+            command.extend(["-t", ASK_TOOLSETS])
+        elif options.toolsets is not None:
+            command.extend(["-t", options.toolsets])
+        command.extend(["-q", actual_prompt])
+        return command
+
+    command = [options.hermes_bin]
+    if options.model:
+        command.extend(["-m", options.model])
+    command.extend(["-z", actual_prompt])
     if options.ask:
         command.extend(["-t", ASK_TOOLSETS])
     elif options.toolsets is not None:
@@ -175,11 +243,233 @@ def _build_hermes_command(options: CallOptions) -> list[str]:
     return command
 
 
+def _run_until_done_call(options: CallOptions) -> CallResult:
+    start = time.monotonic()
+    deadline = start + options.timeout_seconds
+    job: Job | None = None
+    cwd = options.cwd
+
+    if options.sandbox:
+        job = create_job()
+        cwd = job.work
+    elif cwd is None:
+        cwd = Path.cwd()
+    cwd = cwd.expanduser().resolve(strict=False)
+
+    before = capture_session_ids(hermes_bin=options.hermes_bin)
+    first_prompt = _wrap_until_done_prompt(options.prompt)
+    process_results: list[HermesProcessResult] = []
+    outputs: list[str] = []
+    last_work_remains: str | None = None
+    owned_session = SessionCleanupReport(cleaned=False, reason=None)
+
+    first_result = _run_hermes_process_with_prompt(
+        options,
+        cwd=cwd,
+        prompt=first_prompt,
+        timeout_seconds=max(0.0, deadline - time.monotonic()),
+    )
+    process_results.append(first_result)
+    outputs.append(first_result.stdout)
+    after = capture_session_ids(hermes_bin=options.hermes_bin)
+    owned_session = identify_created_session(before, after, hermes_bin=options.hermes_bin, expected_cwd=cwd)
+
+    marker = _parse_completion_marker(first_result.stdout)
+    iterations = 1
+    status = "complete" if marker == TASK_COMPLETE_MARKER else "incomplete"
+    if marker and marker.startswith(WORK_REMAINS_PREFIX):
+        last_work_remains = marker.removeprefix(WORK_REMAINS_PREFIX).strip()
+
+    if first_result.returncode != 0 or first_result.timed_out or marker is None:
+        status = "incomplete"
+
+    while (
+        status != "complete"
+        and owned_session.session_id is not None
+        and iterations < options.max_iterations
+        and time.monotonic() < deadline
+        and process_results[-1].returncode == 0
+        and not process_results[-1].timed_out
+        and last_work_remains is not None
+    ):
+        resume_prompt = _resume_until_done_prompt(last_work_remains)
+        result = _run_hermes_process_with_prompt(
+            options,
+            cwd=cwd,
+            prompt=resume_prompt,
+            resume_session_id=owned_session.session_id,
+            timeout_seconds=max(0.0, deadline - time.monotonic()),
+        )
+        process_results.append(result)
+        outputs.append(result.stdout)
+        iterations += 1
+        marker = _parse_completion_marker(result.stdout)
+        if marker == TASK_COMPLETE_MARKER:
+            status = "complete"
+            break
+        if marker and marker.startswith(WORK_REMAINS_PREFIX):
+            last_work_remains = marker.removeprefix(WORK_REMAINS_PREFIX).strip()
+        else:
+            last_work_remains = None
+        if result.returncode != 0 or result.timed_out:
+            status = "incomplete"
+            break
+
+    cleanup_report = SessionCleanupReport(cleaned=False, reason="keep_session" if options.keep_session else None)
+    if owned_session.session_id is None:
+        cleanup_report = SessionCleanupReport(cleaned=False, reason=owned_session.reason or "no_session_id")
+    elif options.keep_session:
+        cleanup_report = SessionCleanupReport(
+            cleaned=False,
+            reason="keep_session",
+            session_id=owned_session.session_id,
+            model=owned_session.model,
+        )
+    else:
+        deleted = delete_session(owned_session.session_id, hermes_bin=options.hermes_bin)
+        cleanup_report = SessionCleanupReport(
+            cleaned=deleted.cleaned,
+            reason=deleted.reason,
+            session_id=owned_session.session_id,
+            model=owned_session.model,
+        )
+
+    job_deleted = _cleanup_job(job, ok=status == "complete", keep_job=options.keep_job)
+    duration_ms = int((time.monotonic() - start) * 1000)
+    final_process = process_results[-1]
+    exit_code = _until_done_exit_code(status=status, process_result=final_process)
+    answer = _compose_until_done_answer(
+        outputs,
+        status=status,
+        session_id=owned_session.session_id,
+        last_work_remains=last_work_remains,
+        max_iterations_reached=iterations >= options.max_iterations and status != "complete",
+        timed_out=time.monotonic() >= deadline or final_process.timed_out,
+    )
+
+    _emit_diagnostics(
+        options=options,
+        process_result=final_process,
+        cleanup_report=cleanup_report,
+        exit_code=exit_code,
+    )
+
+    return CallResult(
+        ok=status == "complete" and exit_code == 0,
+        answer=answer,
+        model=cleanup_report.model or options.model,
+        duration_ms=duration_ms,
+        session_cleaned=cleanup_report.cleaned,
+        exit_code=exit_code,
+        session_cleanup_reason=cleanup_report.reason,
+        session_id=cleanup_report.session_id,
+        job_dir=str(job.root) if job is not None else None,
+        job_deleted=job_deleted,
+        status=status,
+        iterations=iterations,
+        work_log=tuple(outputs),
+        last_work_remains=last_work_remains,
+    )
+
+
 def _child_env() -> dict[str, str]:
     env = os.environ.copy()
     if env.get("CLUXION_HERMES_CALL_LIVE") == "1":
         env.pop("PYTEST_CURRENT_TEST", None)
     return env
+
+
+def _wrap_until_done_prompt(prompt: str) -> str:
+    return f"{prompt.rstrip()}{COMPLETION_CONTRACT}\n"
+
+
+def _resume_until_done_prompt(last_work_remains: str | None) -> str:
+    remains = last_work_remains or "the task is not complete"
+    return f"Continue the remaining work. Last reported remaining work: {remains}{COMPLETION_CONTRACT}\n"
+
+
+def _parse_completion_marker(text: str) -> str | None:
+    lines = [line.strip() for line in text.rstrip().splitlines() if line.strip()]
+    if not lines:
+        return None
+    last = lines[-1]
+    if last == TASK_COMPLETE_MARKER:
+        return TASK_COMPLETE_MARKER
+    if last.startswith(WORK_REMAINS_PREFIX):
+        return last
+    return None
+
+
+def _strip_completion_marker(text: str) -> str:
+    lines = text.rstrip().splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines:
+        last = lines[-1].strip()
+        if last == TASK_COMPLETE_MARKER or last.startswith(WORK_REMAINS_PREFIX):
+            lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _compose_until_done_answer(
+    outputs: list[str],
+    *,
+    status: str,
+    session_id: str | None,
+    last_work_remains: str | None,
+    max_iterations_reached: bool,
+    timed_out: bool,
+) -> str:
+    body = "\n\n".join(part for part in (_strip_completion_marker(output) for output in outputs) if part)
+    if status == "complete":
+        return body
+
+    reasons: list[str] = []
+    if session_id is None:
+        reasons.append("could not determine the Hermes session id, so continuation was not attempted")
+    if max_iterations_reached:
+        reasons.append("max iterations reached")
+    if timed_out:
+        reasons.append("timeout reached")
+    if last_work_remains:
+        reasons.append(f"last WORK_REMAINS: {last_work_remains}")
+    if not reasons:
+        reasons.append("TASK_COMPLETE was not observed")
+    note = "hermes-call status: incomplete (" + "; ".join(reasons) + ")"
+    return f"{body}\n\n{note}".strip()
+
+
+def _strip_chat_query_preamble(stdout: str) -> str:
+    lines = stdout.splitlines()
+    kept = [line for line in lines if not line.startswith("↻ Resumed session ") and not line.startswith("session_id: ")]
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    text = "\n".join(kept)
+    if stdout.endswith("\n") and text:
+        return f"{text}\n"
+    return text
+
+
+def _cleanup_job(job: Job | None, *, ok: bool, keep_job: bool) -> bool | None:
+    if job is None:
+        return None
+    if ok and not keep_job:
+        decision = delete_job_dir(job.root)
+        if not decision.allowed:
+            _diagnose(f"sandbox cleanup skipped: {decision.reason}; job_dir={job.root}")
+        return decision.allowed
+    if ok and keep_job:
+        return False
+    _diagnose(f"sandbox kept after failure: {job.root}")
+    return False
+
+
+def _until_done_exit_code(*, status: str, process_result: HermesProcessResult) -> int:
+    if process_result.timed_out:
+        return 124
+    if process_result.returncode != 0:
+        return 1
+    return 0 if status == "complete" else 1
 
 
 def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
@@ -200,8 +490,12 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
             pass
         except OSError as exc:
             stderr_chunks.append(f"failed to kill hermes process group {process.pid}: {exc}")
-        stdout, stderr = process.communicate()
-        return stdout or "", _join_stderr(stderr, stderr_chunks)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+            return stdout or "", _join_stderr(stderr, stderr_chunks)
+        except subprocess.TimeoutExpired:
+            stderr_chunks.append(f"hermes process group {process.pid} did not exit after SIGKILL")
+            return "", _join_stderr("", stderr_chunks)
 
 
 def _join_stderr(stderr: str | None, chunks: list[str]) -> str:

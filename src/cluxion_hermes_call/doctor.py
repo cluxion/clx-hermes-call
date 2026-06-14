@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from cluxion_hermes_call.core import CallOptions, CallResult, run_call
+from cluxion_hermes_call.core import ASK_TOOLSETS, CallOptions, CallResult, run_call
 from cluxion_hermes_call.jobs import DEFAULT_JOBS_ROOT
 from cluxion_hermes_call.sessions import CommandRunner, default_runner, parse_session_ids_from_list
 
@@ -68,6 +68,7 @@ def run_doctor(
     checks = [
         _check_hermes_version(hermes_bin=hermes_bin, runner=runner, which=which),
         _check_hermes_help_flags(hermes_bin=hermes_bin, runner=runner),
+        _check_ask_toolset_contract(),
         _check_sessions_help(hermes_bin=hermes_bin, runner=runner),
         _check_sessions_list_parser(hermes_bin=hermes_bin, runner=runner),
         _check_jobs_root(jobs_root),
@@ -121,6 +122,14 @@ def _check_hermes_help_flags(*, hermes_bin: str, runner: CommandRunner) -> Docto
     if not has_toolsets:
         missing.append("-t/--toolsets")
     return DoctorCheck("hermes_help_flags", False, f"missing {', '.join(missing)}")
+
+
+def _check_ask_toolset_contract() -> DoctorCheck:
+    detail = (
+        f"--ask maps to -t {ASK_TOOLSETS}; this is source-verified but Hermes does not expose "
+        "a no-tools discovery command, so `doctor --live` verifies the no-tool behavior"
+    )
+    return DoctorCheck("hermes_ask_toolset", ASK_TOOLSETS == "context_engine", detail)
 
 
 def _check_sessions_help(*, hermes_bin: str, runner: CommandRunner) -> DoctorCheck:

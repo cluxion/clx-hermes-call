@@ -11,12 +11,13 @@ import time
 
 import pytest
 
-from cluxion_hermes_call import cli
+from cluxion_hermes_call import PostHermes, api, cli, core
 from cluxion_hermes_call import plugin as hermes_plugin
 from cluxion_hermes_call.core import CallOptions, CallResult, run_call
 from cluxion_hermes_call.doctor import DoctorCheck, DoctorResult, run_doctor, write_doctor_result
 from cluxion_hermes_call.jobs import MARKER_FILE, create_job, delete_job_dir, gc_jobs
 from cluxion_hermes_call.sessions import (
+    SessionCleanupReport,
     SessionSnapshot,
     cleanup_created_session,
     parse_session_ids_from_list,
@@ -73,6 +74,45 @@ def test_prompt_alias(monkeypatch, capsys):
     assert cli.main(["--prompt", "hello"]) == 0
     assert seen["prompt"] == "hello"
     assert capsys.readouterr().out == "answer\n"
+
+
+def test_model_and_cwd_pass_through_to_subprocess(monkeypatch, tmp_path):
+    calls: list[dict[str, object]] = []
+
+    class FakeProcess:
+        pid = 999999
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "ok", ""
+
+    def fake_popen(command, **kwargs):
+        calls.append({"command": command, "cwd": kwargs["cwd"]})
+        return FakeProcess()
+
+    monkeypatch.setattr(core.subprocess, "Popen", fake_popen)
+
+    result = run_call(
+        CallOptions(
+            prompt="hello",
+            model="grok-4.3",
+            cwd=tmp_path,
+            keep_session=True,
+        )
+    )
+    assert result.ok is True
+    assert calls[-1]["command"] == ["hermes", "-m", "grok-4.3", "-z", "hello"]
+    assert calls[-1]["cwd"] == str(tmp_path)
+
+    run_call(CallOptions(prompt="hello", cwd=tmp_path, keep_session=True))
+    assert "-m" not in calls[-1]["command"]
+
+
+def test_help_prints_default_model_line(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "default_model_help_line", lambda: "Default model: xai-oauth/grok-4.3")
+
+    assert cli.main(["--help"]) == 0
+    assert "Default model: xai-oauth/grok-4.3" in capsys.readouterr().out
 
 
 def test_doctor_cli_json_shape_and_exit_zero(monkeypatch, capsys):
@@ -168,6 +208,7 @@ def test_doctor_static_checks_pass_with_mocked_subprocesses(tmp_path):
     assert {check.name for check in result.checks} == {
         "hermes_version",
         "hermes_help_flags",
+        "hermes_ask_toolset",
         "hermes_sessions_help",
         "hermes_sessions_list_parse",
         "jobs_root_writable",
@@ -491,6 +532,135 @@ def test_timeout_kills_fake_hermes_process(tmp_path):
     assert result.exit_code == 124
 
 
+def test_terminate_process_group_has_sigkill_communicate_timeout(monkeypatch):
+    class StubbornProcess:
+        pid = 12345
+        calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            raise subprocess.TimeoutExpired(["fake"], timeout)
+
+    process = StubbornProcess()
+    monkeypatch.setattr(core.os, "killpg", lambda pid, sig: None)
+
+    stdout, stderr = core._terminate_process_group(process)
+
+    assert stdout == ""
+    assert process.calls == 2
+    assert "did not exit after SIGKILL" in stderr
+
+
+def test_until_done_loops_until_task_complete(monkeypatch):
+    calls: list[dict[str, object]] = []
+    outputs = [
+        core.HermesProcessResult("first step\nWORK_REMAINS: finish it\n", "", 0, False),
+        core.HermesProcessResult("final step\nTASK_COMPLETE\n", "", 0, False),
+    ]
+
+    monkeypatch.setattr(core, "capture_session_ids", lambda **kwargs: SessionSnapshot(frozenset({"before"})))
+    monkeypatch.setattr(
+        core,
+        "identify_created_session",
+        lambda *args, **kwargs: SessionCleanupReport(False, session_id="owned", model="grok-4.3"),
+    )
+    monkeypatch.setattr(core, "delete_session", lambda *args, **kwargs: SessionCleanupReport(True, session_id="owned"))
+
+    def fake_run_process(options, *, cwd, prompt, resume_session_id=None, timeout_seconds=None):
+        calls.append({"prompt": prompt, "resume_session_id": resume_session_id})
+        return outputs.pop(0)
+
+    monkeypatch.setattr(core, "_run_hermes_process_with_prompt", fake_run_process)
+
+    result = run_call(CallOptions(prompt="do it", until_done=True, max_iterations=4))
+
+    assert result.ok is True
+    assert result.status == "complete"
+    assert result.iterations == 2
+    assert result.session_cleaned is True
+    assert result.answer == "first step\n\nfinal step"
+    assert calls[0]["resume_session_id"] is None
+    assert calls[1]["resume_session_id"] == "owned"
+    assert "Completion contract for hermes-call --until-done" in calls[0]["prompt"]
+
+
+def test_until_done_stops_incomplete_at_max_iterations(monkeypatch):
+    monkeypatch.setattr(core, "capture_session_ids", lambda **kwargs: SessionSnapshot(frozenset({"before"})))
+    monkeypatch.setattr(
+        core,
+        "identify_created_session",
+        lambda *args, **kwargs: SessionCleanupReport(False, session_id="owned", model="grok-4.3"),
+    )
+    monkeypatch.setattr(core, "delete_session", lambda *args, **kwargs: SessionCleanupReport(True, session_id="owned"))
+
+    def fake_run_process(options, *, cwd, prompt, resume_session_id=None, timeout_seconds=None):
+        return core.HermesProcessResult("partial\nWORK_REMAINS: still open\n", "", 0, False)
+
+    monkeypatch.setattr(core, "_run_hermes_process_with_prompt", fake_run_process)
+
+    result = run_call(CallOptions(prompt="do it", until_done=True, max_iterations=2))
+
+    assert result.ok is False
+    assert result.status == "incomplete"
+    assert result.iterations == 2
+    assert result.last_work_remains == "still open"
+    assert result.exit_code == 1
+    assert "max iterations reached" in result.answer
+
+
+def test_until_done_no_session_id_does_not_loop(monkeypatch):
+    calls = 0
+
+    monkeypatch.setattr(core, "capture_session_ids", lambda **kwargs: SessionSnapshot(frozenset({"before"})))
+    monkeypatch.setattr(
+        core,
+        "identify_created_session",
+        lambda *args, **kwargs: SessionCleanupReport(False, reason="multiple_new_sessions:2"),
+    )
+
+    def fake_run_process(options, *, cwd, prompt, resume_session_id=None, timeout_seconds=None):
+        nonlocal calls
+        calls += 1
+        return core.HermesProcessResult("partial\nWORK_REMAINS: need resume\n", "", 0, False)
+
+    monkeypatch.setattr(core, "_run_hermes_process_with_prompt", fake_run_process)
+
+    result = run_call(CallOptions(prompt="do it", until_done=True, max_iterations=3))
+
+    assert calls == 1
+    assert result.ok is False
+    assert result.status == "incomplete"
+    assert result.session_cleanup_reason == "multiple_new_sessions:2"
+    assert "could not determine the Hermes session id" in result.answer
+
+
+def test_posthermes_simple_returns_string_and_structured_returns_object(monkeypatch):
+    seen: list[CallOptions] = []
+
+    def fake_run_call(options: CallOptions) -> CallResult:
+        seen.append(options)
+        return CallResult(
+            ok=True,
+            answer="api-answer",
+            model=options.model,
+            duration_ms=1,
+            session_cleaned=True,
+            exit_code=0,
+            status="complete" if options.until_done else None,
+            iterations=1 if options.until_done else None,
+        )
+
+    monkeypatch.setattr(api, "run_call", fake_run_call)
+
+    assert PostHermes(model="grok-4.3", path="/tmp", prompt="hi") == "api-answer"
+    structured = PostHermes.run(model="grok-4.3", path="/tmp", prompt="hi", until_done=True)
+
+    assert structured.answer == "api-answer"
+    assert structured.status == "complete"
+    assert seen[0].model == "grok-4.3"
+    assert str(seen[0].cwd) == "/tmp"
+
+
 def test_gc_removes_old_unlocked_and_keeps_fresh_or_locked(tmp_path):
     jobs_root = tmp_path / "jobs"
     old = create_job(jobs_root=jobs_root)
@@ -528,3 +698,21 @@ def test_live_sandbox_smoke(capsys):
     assert payload["ok"] is True
     assert "sandbox-ok" in payload["answer"].lower()
     assert set(payload) == {"ok", "answer", "model", "duration_ms", "session_cleaned", "exit_code"}
+
+
+@live
+def test_live_until_done_smoke(capsys):
+    code = cli.main(
+        [
+            "-m",
+            "grok-4.3",
+            "--until-done",
+            "--max-iterations",
+            "3",
+            "--timeout",
+            "180",
+            "Reply with exactly LIVE_UNTIL_DONE_OK on one line and TASK_COMPLETE on the final line.",
+        ]
+    )
+    assert code == 0
+    assert "LIVE_UNTIL_DONE_OK" in capsys.readouterr().out
