@@ -63,7 +63,7 @@ def capture_session_ids(
     *,
     hermes_bin: str = "hermes",
     runner: CommandRunner = default_runner,
-    limit: int = 10000,
+    limit: int = 50,
 ) -> SessionSnapshot:
     """Capture visible CLI session IDs through `hermes sessions list`."""
     completed = _run_session_command(

@@ -585,3 +585,34 @@ def test_doctor_no_usage_on_stderr(monkeypatch, capsys):
     assert cli.main(["doctor"]) == 0
     err = capsys.readouterr().err
     assert "usage:" not in err.lower()
+
+def test_capture_uses_bounded_limit():
+    """Assert session-capture uses a bounded --limit (newest-N) not full unbounded list."""
+    import subprocess
+
+    from cluxion_hermes_call.sessions import capture_session_ids
+
+    captured_cmds: list[list[str]] = []
+
+    def fake_runner(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+        captured_cmds.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    # call with default
+    snap = capture_session_ids(runner=fake_runner)
+    assert snap.ok
+    # find the list command
+    list_cmds = [c for c in captured_cmds if "sessions" in c and "list" in c]
+    assert list_cmds, "should have called sessions list"
+    for cmd in list_cmds:
+        assert "--limit" in cmd
+        idx = cmd.index("--limit")
+        lim = int(cmd[idx + 1])
+        assert lim <= 50, f"limit should be bounded to <=50, got {lim}"
+        assert lim == 50  # our chosen default
+
+    captured_cmds.clear()
+    # also explicit small limit works
+    capture_session_ids(runner=fake_runner, limit=20)
+    list_cmds2 = [c for c in captured_cmds if "sessions" in c and "list" in c]
+    assert any("--limit" in c and int(c[c.index("--limit")+1]) == 20 for c in list_cmds2)
