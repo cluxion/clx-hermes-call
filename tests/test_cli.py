@@ -575,3 +575,13 @@ def test_live_until_done_smoke(capsys):
     )
     assert code == 0
     assert "LIVE_UNTIL_DONE_OK" in capsys.readouterr().out
+
+
+def test_doctor_no_usage_on_stderr(monkeypatch, capsys):
+    result = DoctorResult(plugin="hermes-call", version="0.3.3", checks=())
+    def fake_framework_run_doctor(**kw):
+        return result
+    monkeypatch.setattr(cli, "framework_run_doctor", fake_framework_run_doctor)
+    assert cli.main(["doctor"]) == 0
+    err = capsys.readouterr().err
+    assert "usage:" not in err.lower()

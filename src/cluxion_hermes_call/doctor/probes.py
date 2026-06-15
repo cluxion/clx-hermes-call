@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.metadata
 import io
 import json
@@ -125,7 +126,8 @@ def empty_prompt_rejected(ctx: DoctorContext) -> tuple[str, str]:
         dummy_parser = argparse.ArgumentParser()
         # should raise SystemExit via parser.error
         try:
-            cli._resolve_prompt("", None, stdin=dummy_stdin, parser=dummy_parser)
+            with contextlib.redirect_stderr(io.StringIO()):
+                cli._resolve_prompt("", None, stdin=dummy_stdin, parser=dummy_parser)
             return "fail", "_resolve_prompt did not reject empty"
         except SystemExit:
             pass
