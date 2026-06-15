@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import io
+import json
 import shutil
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -155,11 +157,32 @@ def doctor_gc_magic_safe(ctx: DoctorContext) -> tuple[str, str]:
         src = ""
         if hasattr(plugin, "__file__"):
             src = Path(plugin.__file__).read_text()
-        if "shaping = bool" in src and "if prompt == \"doctor\" and not shaping" in src:
+        if "shaping = bool" in src and 'if prompt == "doctor" and not shaping' in src:
             return "pass", "magic gate on shaping present"
         return "fail", "shaping gate missing in _handle_call_command"
     except Exception as e:
         return "skip", f"cannot inspect: {e}"
+
+
+@_register("python_version_incompatibility")
+def python_version_incompatibility(ctx: DoctorContext) -> tuple[str, str]:
+    vi = sys.version_info
+    if (vi.major, vi.minor) >= (3, 11):
+        return "pass", f"python {vi.major}.{vi.minor}"
+    return "warn", f"python {vi.major}.{vi.minor} < 3.11"
+
+
+@_register("json_mode_output_malformed")
+def json_mode_output_malformed(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        d = {"a": 1, "b": [2, 3], "c": "test"}
+        s1 = json.dumps(d, sort_keys=True)
+        s2 = json.dumps(d, sort_keys=True)
+        if s1 == s2:
+            return "pass", "json roundtrip deterministic"
+        return "fail", "json not deterministic"
+    except Exception as e:
+        return "skip", f"json error: {e}"
 
 
 # note: other checks (many in catalog) reported as skip (no probe)
