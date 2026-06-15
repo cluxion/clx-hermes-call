@@ -12,10 +12,11 @@ from cluxion_hermes_call import __version__
 from cluxion_hermes_call.config import default_model_help_line
 from cluxion_hermes_call.core import CallOptions, CallResult, run_call
 from cluxion_hermes_call.doctor.framework import (
-    DoctorContext,
     DoctorResult,
     render_json,
     render_text,
+)
+from cluxion_hermes_call.doctor.framework import (
     run_doctor as framework_run_doctor,
 )
 from cluxion_hermes_call.doctor.live import live_checks

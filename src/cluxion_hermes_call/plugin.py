@@ -9,7 +9,8 @@ from cluxion_hermes_call import __version__
 from cluxion_hermes_call.cli import add_call_arguments, options_from_namespace
 from cluxion_hermes_call.config import default_model_help_line
 from cluxion_hermes_call.core import run_call
-from cluxion_hermes_call.doctor.framework import DoctorResult, render_json, run_doctor as framework_run_doctor
+from cluxion_hermes_call.doctor.framework import DoctorResult, render_json
+from cluxion_hermes_call.doctor.framework import run_doctor as framework_run_doctor
 from cluxion_hermes_call.doctor.live import live_checks
 from cluxion_hermes_call.doctor.probes import PROBES
 from cluxion_hermes_call.jobs import gc_jobs

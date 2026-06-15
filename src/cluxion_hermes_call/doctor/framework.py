@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 SEVERITY_RANK: dict[str, int] = {
     "critical": 0,

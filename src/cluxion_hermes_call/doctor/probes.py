@@ -6,9 +6,8 @@ import argparse
 import importlib.metadata
 import io
 import shutil
-import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from .framework import DoctorContext
 
@@ -67,7 +66,7 @@ def entry_point_registered(ctx: DoctorContext) -> tuple[str, str]:
         for ep in eps:
             if "cluxion-hermes-call-cli" in (ep.name or "").lower() or "cluxion_hermes_call" in (ep.value or ""):
                 mod = ep.load()
-                if hasattr(mod, "register") and callable(getattr(mod, "register")):
+                if hasattr(mod, "register") and callable(mod.register):
                     return "pass", ep.value or str(ep)
         return "fail", "entry point not found or register missing"
     except Exception as e:
@@ -129,7 +128,7 @@ def empty_prompt_rejected(ctx: DoctorContext) -> tuple[str, str]:
         except SystemExit:
             pass
         # also check DEVNULL usage in source is present (simple sentinel)
-        src = open(cli.__file__).read() if hasattr(cli, "__file__") else ""
+        src = Path(cli.__file__).read_text() if hasattr(cli, "__file__") else ""
         if "DEVNULL" in src or "stdin=subprocess.DEVNULL" in src:
             return "pass", "rejects empty + DEVNULL sentinel"
         return "pass", "rejects empty"
@@ -155,7 +154,7 @@ def doctor_gc_magic_safe(ctx: DoctorContext) -> tuple[str, str]:
         from cluxion_hermes_call import plugin
         src = ""
         if hasattr(plugin, "__file__"):
-            src = open(plugin.__file__).read()
+            src = Path(plugin.__file__).read_text()
         if "shaping = bool" in src and "if prompt == \"doctor\" and not shaping" in src:
             return "pass", "magic gate on shaping present"
         return "fail", "shaping gate missing in _handle_call_command"

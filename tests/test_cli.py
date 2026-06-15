@@ -14,7 +14,7 @@ import pytest
 from cluxion_hermes_call import PostHermes, api, cli, core
 from cluxion_hermes_call import plugin as hermes_plugin
 from cluxion_hermes_call.core import CallOptions, CallResult, run_call
-from cluxion_hermes_call.doctor.framework import CheckResult, DoctorResult, render_json, run_doctor as framework_run_doctor
+from cluxion_hermes_call.doctor.framework import CheckResult, DoctorResult
 from cluxion_hermes_call.jobs import MARKER_FILE, create_job, delete_job_dir, gc_jobs
 from cluxion_hermes_call.sessions import (
     SessionCleanupReport,
@@ -26,7 +26,7 @@ from cluxion_hermes_call.sessions import (
 
 def test_version_flag(capsys):
     assert cli.main(["--version"]) == 0
-    assert "hermes-call" in capsys.readouterr().out if False else capsys.readouterr().out
+    assert "hermes-call" in capsys.readouterr().out
 
 
 def test_usage_error_returns_2(capsys):
@@ -52,7 +52,7 @@ def test_stdin_prompt_and_json_shape(monkeypatch, capsys):
     assert cli.main(["-", "--json"], stdin=io.StringIO("hello from stdin")) == 0
 
     assert seen["prompt"] == "hello from stdin"
-    payload = json.loads(capsys.readouterr().out if False else capsys.readouterr().out)
+    payload = json.loads(capsys.readouterr().out)
     assert payload == {
         "ok": True,
         "answer": "pong",
@@ -73,7 +73,7 @@ def test_prompt_alias(monkeypatch, capsys):
     monkeypatch.setattr(cli, "run_call", fake_run_call)
     assert cli.main(["--prompt", "hello"]) == 0
     assert seen["prompt"] == "hello"
-    assert capsys.readouterr().out if False else capsys.readouterr().out == "answer\n"
+    assert capsys.readouterr().out == "answer\n"
 
 
 def test_model_and_cwd_pass_through_to_subprocess(monkeypatch, tmp_path):
@@ -112,7 +112,7 @@ def test_help_prints_default_model_line(monkeypatch, capsys):
     monkeypatch.setattr(cli, "default_model_help_line", lambda: "Default model: xai-oauth/grok-4.3")
 
     assert cli.main(["--help"]) == 0
-    assert "Default model: xai-oauth/grok-4.3" in capsys.readouterr().out if False else capsys.readouterr().out
+    assert "Default model: xai-oauth/grok-4.3" in capsys.readouterr().out
 
 
 
@@ -123,11 +123,10 @@ def test_doctor_cli_json_shape_and_exit_zero(monkeypatch, capsys):
         return result
     monkeypatch.setattr(cli, "framework_run_doctor", fake_framework_run_doctor)
     assert cli.main(["doctor", "--json"]) == 0
-    payload = json.loads(capsys.readouterr().out if False else capsys.readouterr().out)
+    payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
 
 def test_doctor_cli_live_failure_exits_one(monkeypatch, capsys):
-    from cluxion_hermes_call.doctor.live import live_checks as real_live
     def fake_live(t):
         return [CheckResult(check_id="live_answer", category="live", severity="high", status="fail", detail="fail")]
     monkeypatch.setattr(cli, "live_checks", fake_live)
@@ -547,14 +546,14 @@ live = pytest.mark.skipif(os.getenv("CLUXION_HERMES_CALL_LIVE") != "1", reason="
 def test_live_ask_smoke(capsys):
     code = cli.main(["--ask", "Reply with exactly pong.", "--timeout", "120"])
     assert code == 0
-    assert "pong" in capsys.readouterr().out if False else capsys.readouterr().out.lower()
+    assert "pong" in capsys.readouterr().out.lower()
 
 
 @live
 def test_live_sandbox_smoke(capsys):
     code = cli.main(["--sandbox", "--ask", "Reply with exactly sandbox-ok.", "--timeout", "120", "--json"])
     assert code == 0
-    payload = json.loads(capsys.readouterr().out if False else capsys.readouterr().out)
+    payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert "sandbox-ok" in payload["answer"].lower()
     assert set(payload) == {"ok", "answer", "model", "duration_ms", "session_cleaned", "exit_code"}
@@ -575,4 +574,4 @@ def test_live_until_done_smoke(capsys):
         ]
     )
     assert code == 0
-    assert "LIVE_UNTIL_DONE_OK" in capsys.readouterr().out if False else capsys.readouterr().out
+    assert "LIVE_UNTIL_DONE_OK" in capsys.readouterr().out
