@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
+
 from cluxion_hermes_call.api import PostHermes, PostHermesError
 
-__version__ = "0.3.4"
+try:
+    __version__ = version("cluxion-hermes-call-cli")
+except PackageNotFoundError:  # pragma: no cover
+    __version__ = "0.3.5"
 
 __all__ = ["PostHermes", "PostHermesError", "__version__"]

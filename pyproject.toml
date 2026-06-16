@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cluxion-hermes-call-cli"
-version = "0.3.5"
+version = "0.3.6"
 description = "Use your Hermes Agent like an AI API: one-shot exec CLI (codex-exec style) with session self-cleanup"
 readme = "README.md"
 requires-python = ">=3.11"
