@@ -5,12 +5,17 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 SESSION_ID_AT_EOL_RE = re.compile(r"(?P<id>\d{8}_\d{6}_[0-9a-fA-F]+)\s*$")
+RELATIVE_LAST_ACTIVE_RE = re.compile(
+    r"(?P<value>just now|\d+m ago|\d+h ago|yesterday|\d+d ago|\d{4}-\d{2}-\d{2}|\?)\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,37 @@ class SessionSelection:
     session_id: str | None
     model: str | None
     reason: str | None
+
+
+@dataclass(frozen=True)
+class SessionGcMetadata:
+    """Metadata needed to decide whether a CLI session is safe to GC."""
+
+    session_id: str
+    source: str | None = None
+    title: str | None = None
+    ended_at: float | None = None
+    last_active: float | None = None
+    error: str | None = None
+
+
+@dataclass
+class SessionGcReport:
+    """Summary of a session GC pass."""
+
+    dry_run: bool
+    deleted: int = 0
+    kept_named: int = 0
+    skipped_recent: int = 0
+    skipped_unknown: int = 0
+    failed: int = 0
+    optimized: bool = False
+    deleted_ids: list[str] = field(default_factory=list)
+    kept_named_ids: list[str] = field(default_factory=list)
+    skipped_recent_ids: list[str] = field(default_factory=list)
+    skipped_unknown_ids: list[str] = field(default_factory=list)
+    failed_ids: list[str] = field(default_factory=list)
+    error: str | None = None
 
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
@@ -240,6 +276,280 @@ def select_session_by_exported_cwd(
         match = matches[0]
         return SessionSelection(match.session_id, match.model, None)
     return SessionSelection(None, None, f"cwd_match_count:{len(matches)}")
+
+
+def gc_sessions(
+    *,
+    dry_run: bool = True,
+    idle_minutes: int = 10,
+    hermes_bin: str = "hermes",
+    runner: CommandRunner = default_runner,
+    list_limit: int = 10_000,
+    optimize: bool = True,
+    now: float | None = None,
+) -> SessionGcReport:
+    """Garbage-collect orphaned untitled CLI sessions (fail-closed, dry-run by default)."""
+    report = SessionGcReport(dry_run=dry_run)
+    if idle_minutes <= 0:
+        report.error = "idle_minutes_must_be_positive"
+        return report
+
+    completed = _run_session_command(
+        [hermes_bin, "sessions", "list", "--source", "cli", "--limit", str(list_limit)],
+        runner=runner,
+    )
+    if completed.returncode != 0:
+        report.error = f"list_failed:{_short_error(completed.stderr or completed.stdout or f'exit {completed.returncode}')}"
+        return report
+
+    session_ids = sorted(parse_session_ids_from_list(completed.stdout))
+    if not session_ids:
+        return report
+
+    list_rows = parse_session_list_rows(completed.stdout)
+    list_row_by_id = {row["id"]: row for row in list_rows}
+    rich_by_id = _load_rich_cli_sessions(hermes_bin=hermes_bin, runner=runner, list_limit=list_limit)
+    current_time = time.time() if now is None else now
+    idle_seconds = idle_minutes * 60
+
+    for session_id in session_ids:
+        metadata = _resolve_session_gc_metadata(
+            session_id,
+            list_row=list_row_by_id.get(session_id),
+            rich=rich_by_id.get(session_id),
+            hermes_bin=hermes_bin,
+            runner=runner,
+        )
+        decision = _classify_session_for_gc(metadata, idle_seconds=idle_seconds, now=current_time)
+        if decision == "kept_named":
+            report.kept_named += 1
+            report.kept_named_ids.append(session_id)
+            continue
+        if decision == "skipped_recent":
+            report.skipped_recent += 1
+            report.skipped_recent_ids.append(session_id)
+            continue
+        if decision == "skipped_unknown":
+            report.skipped_unknown += 1
+            report.skipped_unknown_ids.append(session_id)
+            continue
+
+        if dry_run:
+            report.deleted += 1
+            report.deleted_ids.append(session_id)
+            continue
+
+        deleted = delete_session(session_id, hermes_bin=hermes_bin, runner=runner)
+        if deleted.cleaned:
+            report.deleted += 1
+            report.deleted_ids.append(session_id)
+        else:
+            report.failed += 1
+            report.failed_ids.append(session_id)
+
+    if not dry_run and report.deleted > 0 and optimize:
+        report.optimized = optimize_session_store(hermes_bin=hermes_bin, runner=runner)
+
+    return report
+
+
+def optimize_session_store(
+    *,
+    hermes_bin: str = "hermes",
+    runner: CommandRunner = default_runner,
+) -> bool:
+    """Run `hermes sessions optimize` to reclaim disk after bulk deletion."""
+    completed = _run_session_command([hermes_bin, "sessions", "optimize"], runner=runner)
+    return completed.returncode == 0
+
+
+def parse_session_list_rows(output: str) -> list[dict[str, str]]:
+    """Parse session rows from `hermes sessions list` table output."""
+    rows: list[dict[str, str]] = []
+    for line in output.splitlines():
+        id_match = SESSION_ID_AT_EOL_RE.search(line)
+        if not id_match:
+            continue
+        session_id = id_match.group("id")
+        prefix = line[: id_match.start()].rstrip()
+        last_active = "?"
+        relative_match = RELATIVE_LAST_ACTIVE_RE.search(prefix)
+        if relative_match:
+            last_active = relative_match.group("value")
+            prefix = prefix[: relative_match.start()].rstrip()
+        source = "cli"
+        if prefix.endswith(" cli"):
+            prefix, source = prefix.rsplit(maxsplit=1)
+        rows.append({"id": session_id, "last_active": last_active, "source": source})
+    return rows
+
+
+def parse_relative_last_active(value: str, *, now: float | None = None) -> float | None:
+    """Convert a `hermes sessions list` relative timestamp to a unix timestamp."""
+    current_time = time.time() if now is None else now
+    text = value.strip()
+    if not text or text == "?":
+        return None
+    if text == "just now":
+        return current_time
+    if text == "yesterday":
+        return current_time - 36 * 3600
+    if text.endswith("m ago"):
+        try:
+            minutes = int(text[:-5])
+        except ValueError:
+            return None
+        return current_time - minutes * 60
+    if text.endswith("h ago"):
+        try:
+            hours = int(text[:-5])
+        except ValueError:
+            return None
+        return current_time - hours * 3600
+    if text.endswith("d ago"):
+        try:
+            days = int(text[:-5])
+        except ValueError:
+            return None
+        return current_time - days * 86400
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return parsed.timestamp()
+
+
+def _classify_session_for_gc(metadata: SessionGcMetadata, *, idle_seconds: float, now: float) -> str:
+    if metadata.error is not None:
+        return "skipped_unknown"
+    if metadata.source not in (None, "cli"):
+        return "skipped_unknown"
+    if _session_has_title(metadata.title):
+        return "kept_named"
+    if metadata.ended_at is not None:
+        return "delete"
+    if metadata.last_active is None:
+        return "skipped_unknown"
+    if now - metadata.last_active < idle_seconds:
+        return "skipped_recent"
+    return "delete"
+
+
+def _session_has_title(title: str | None) -> bool:
+    return bool(title and str(title).strip())
+
+
+def _resolve_session_gc_metadata(
+    session_id: str,
+    *,
+    list_row: dict[str, str] | None,
+    rich: dict[str, Any] | None,
+    hermes_bin: str,
+    runner: CommandRunner,
+) -> SessionGcMetadata:
+    if rich is not None:
+        return SessionGcMetadata(
+            session_id=session_id,
+            source=str(rich.get("source")) if rich.get("source") else None,
+            title=str(rich["title"]) if rich.get("title") else None,
+            ended_at=_coerce_timestamp(rich.get("ended_at")),
+            last_active=_coerce_timestamp(rich.get("last_active")),
+        )
+
+    exported = _fetch_exported_session_record(session_id, hermes_bin=hermes_bin, runner=runner)
+    if exported is not None:
+        last_active = _coerce_timestamp(exported.get("last_active"))
+        if last_active is None:
+            messages = exported.get("messages") or []
+            if messages:
+                timestamps = [_coerce_timestamp(item.get("timestamp")) for item in messages]
+                known = [item for item in timestamps if item is not None]
+                last_active = max(known) if known else None
+        if last_active is None and list_row is not None:
+            last_active = parse_relative_last_active(list_row.get("last_active", "?"))
+        if last_active is None:
+            last_active = _coerce_timestamp(exported.get("started_at"))
+
+        title = exported.get("title")
+        return SessionGcMetadata(
+            session_id=session_id,
+            source=str(exported.get("source")) if exported.get("source") else None,
+            title=str(title) if title else None,
+            ended_at=_coerce_timestamp(exported.get("ended_at")),
+            last_active=last_active,
+        )
+
+    source = list_row.get("source") if list_row else None
+    return SessionGcMetadata(session_id=session_id, source=source, error="missing_export_record")
+
+
+def _fetch_exported_session_record(
+    session_id: str,
+    *,
+    hermes_bin: str,
+    runner: CommandRunner,
+) -> dict[str, Any] | None:
+    completed = _run_session_command([hermes_bin, "sessions", "export", "-", "--session-id", session_id], runner=runner)
+    if completed.returncode != 0:
+        return None
+    for line in completed.stdout.splitlines():
+        try:
+            data: dict[str, Any] = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if data.get("id") == session_id:
+            return data
+    return None
+
+
+def _load_rich_cli_sessions(
+    *,
+    hermes_bin: str,
+    runner: CommandRunner,
+    list_limit: int,
+) -> dict[str, dict[str, Any]]:
+    db = _try_open_session_db()
+    if db is None:
+        return {}
+    try:
+        sessions = db.list_sessions_rich(source="cli", limit=list_limit)
+    except Exception:
+        return {}
+    finally:
+        close = getattr(db, "close", None)
+        if callable(close):
+            close()
+    return {str(item["id"]): item for item in sessions if item.get("id")}
+
+
+def _try_open_session_db() -> Any | None:
+    try:
+        from hermes_state import SessionDB
+    except ImportError:
+        return None
+    try:
+        return SessionDB()
+    except Exception:
+        return None
+
+
+def _coerce_timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+    return None
 
 
 def _short_error(text: str, *, max_len: int = 300) -> str:

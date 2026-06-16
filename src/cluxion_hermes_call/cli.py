@@ -22,6 +22,7 @@ from cluxion_hermes_call.doctor.framework import (
 from cluxion_hermes_call.doctor.live import live_checks
 from cluxion_hermes_call.doctor.probes import PROBES
 from cluxion_hermes_call.jobs import gc_jobs
+from cluxion_hermes_call.sessions import gc_sessions
 
 
 def add_call_arguments(parser: argparse.ArgumentParser) -> None:
@@ -52,6 +53,23 @@ def build_call_parser(prog: str = "hermes-call") -> argparse.ArgumentParser:
 def build_gc_parser(prog: str = "hermes-call gc") -> argparse.ArgumentParser:
     """Build the gc subcommand parser."""
     parser = argparse.ArgumentParser(prog=prog)
+    parser.add_argument("--sessions", action="store_true", help="Garbage-collect orphaned untitled CLI Hermes sessions")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete sessions (with --sessions); default is dry-run",
+    )
+    parser.add_argument(
+        "--idle-minutes",
+        type=int,
+        default=10,
+        help="Keep untitled sessions updated within this many minutes (default: 10)",
+    )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="Skip `hermes sessions optimize` after a real session deletion pass",
+    )
     parser.add_argument("-V", "--version", action="store_true", help="Show version and exit")
     return parser
 
@@ -82,11 +100,34 @@ def _main_gc(argv: list[str]) -> int:
     parser = build_gc_parser()
     try:
         ns = parser.parse_args(argv)
+        if ns.idle_minutes <= 0:
+            parser.error("--idle-minutes must be greater than 0")
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
     if ns.version:
         print(f"hermes-call {__version__}")
         return 0
+    if ns.sessions:
+        report = gc_sessions(
+            dry_run=not ns.apply,
+            idle_minutes=ns.idle_minutes,
+            optimize=not ns.no_optimize,
+        )
+        if report.error:
+            print(report.error, file=sys.stderr)
+            return 1
+        print(
+            "sessions "
+            f"dry_run={report.dry_run} "
+            f"deleted={report.deleted} "
+            f"kept_named={report.kept_named} "
+            f"skipped_recent={report.skipped_recent} "
+            f"skipped_unknown={report.skipped_unknown} "
+            f"failed={report.failed} "
+            f"optimized={report.optimized}"
+        )
+        return 0 if report.failed == 0 else 1
+
     removed, kept = gc_jobs()
     print(f"removed={removed} kept={kept}")
     return 0

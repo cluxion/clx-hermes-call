@@ -20,6 +20,8 @@ from cluxion_hermes_call.sessions import (
     SessionCleanupReport,
     SessionSnapshot,
     cleanup_created_session,
+    gc_sessions,
+    parse_relative_last_active,
     parse_session_ids_from_list,
 )
 
@@ -585,6 +587,189 @@ def test_doctor_no_usage_on_stderr(monkeypatch, capsys):
     assert cli.main(["doctor"]) == 0
     err = capsys.readouterr().err
     assert "usage:" not in err.lower()
+
+def _gc_list_output(rows: list[dict[str, str]]) -> str:
+    lines = [
+        "Preview                                            Last Active   Src    ID",
+        "───────────────────────────────────────────────────────────────────────────────────────────────",
+    ]
+    for row in rows:
+        preview = row.get("preview", "untitled preview")
+        lines.append(f"{preview:<50} {row['last_active']:<13} cli    {row['id']}")
+    return "\n".join(lines) + "\n"
+
+
+def _gc_export_record(
+    session_id: str,
+    *,
+    title: str | None = None,
+    ended_at: float | None = None,
+    last_message_at: float | None = None,
+    started_at: float | None = None,
+) -> str:
+    payload = {
+        "id": session_id,
+        "source": "cli",
+        "title": title,
+        "ended_at": ended_at,
+        "started_at": started_at,
+        "messages": [],
+    }
+    if last_message_at is not None:
+        payload["messages"] = [{"timestamp": last_message_at}]
+    return json.dumps(payload) + "\n"
+
+
+def test_gc_sessions_deletes_untitled_stale_when_apply(monkeypatch):
+    now = 1_000_000.0
+    deleted: list[str] = []
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: {})
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:4] == ["hermes", "sessions", "list", "--source"]:
+            return _completed(
+                command,
+                stdout=_gc_list_output([{"id": "20260612_120000_aaaa01", "last_active": "30m ago"}]),
+            )
+        if command[:3] == ["hermes", "sessions", "export"]:
+            return _completed(command, stdout=_gc_export_record(command[-1], last_message_at=now - 1800))
+        if command[:3] == ["hermes", "sessions", "delete"]:
+            deleted.append(command[-1])
+            return _completed(command, stdout=f"Deleted session '{command[-1]}'.\n")
+        if command[:3] == ["hermes", "sessions", "optimize"]:
+            return _completed(command, stdout="optimized\n")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    report = gc_sessions(dry_run=False, idle_minutes=10, runner=runner, now=now)
+    assert report.deleted == 1
+    assert report.deleted_ids == ["20260612_120000_aaaa01"]
+    assert deleted == ["20260612_120000_aaaa01"]
+    assert report.optimized is True
+
+
+def test_gc_sessions_reports_untitled_stale_in_dry_run(monkeypatch):
+    now = 1_000_000.0
+    deleted: list[str] = []
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: {})
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:4] == ["hermes", "sessions", "list", "--source"]:
+            return _completed(
+                command,
+                stdout=_gc_list_output([{"id": "20260612_120000_aaaa01", "last_active": "30m ago"}]),
+            )
+        if command[:3] == ["hermes", "sessions", "export"]:
+            return _completed(command, stdout=_gc_export_record(command[-1], last_message_at=now - 1800))
+        if command[:3] == ["hermes", "sessions", "delete"]:
+            deleted.append(command[-1])
+            return _completed(command, stdout=f"Deleted session '{command[-1]}'.\n")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    report = gc_sessions(dry_run=True, idle_minutes=10, runner=runner, now=now)
+    assert report.dry_run is True
+    assert report.deleted == 1
+    assert report.deleted_ids == ["20260612_120000_aaaa01"]
+    assert deleted == []
+
+
+def test_gc_sessions_keeps_named_sessions(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: {})
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:4] == ["hermes", "sessions", "list", "--source"]:
+            return _completed(
+                command,
+                stdout=_gc_list_output([{"id": "20260612_120000_bbbb01", "last_active": "30m ago"}]),
+            )
+        if command[:3] == ["hermes", "sessions", "export"]:
+            return _completed(
+                command,
+                stdout=_gc_export_record(command[-1], title="Important session", last_message_at=now - 1800),
+            )
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    report = gc_sessions(dry_run=False, idle_minutes=10, runner=runner, now=now)
+    assert report.deleted == 0
+    assert report.kept_named == 1
+    assert report.kept_named_ids == ["20260612_120000_bbbb01"]
+
+
+def test_gc_sessions_keeps_recent_untitled_sessions(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: {})
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:4] == ["hermes", "sessions", "list", "--source"]:
+            return _completed(
+                command,
+                stdout=_gc_list_output([{"id": "20260612_120000_cccc01", "last_active": "just now"}]),
+            )
+        if command[:3] == ["hermes", "sessions", "export"]:
+            return _completed(command, stdout=_gc_export_record(command[-1], last_message_at=now - 30))
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    report = gc_sessions(dry_run=False, idle_minutes=10, runner=runner, now=now)
+    assert report.deleted == 0
+    assert report.skipped_recent == 1
+    assert report.skipped_recent_ids == ["20260612_120000_cccc01"]
+
+
+def test_gc_sessions_keeps_unknown_timestamp_fail_closed(monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: {})
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:4] == ["hermes", "sessions", "list", "--source"]:
+            return _completed(
+                command,
+                stdout=_gc_list_output([{"id": "20260612_120000_dddd01", "last_active": "?"}]),
+            )
+        if command[:3] == ["hermes", "sessions", "export"]:
+            return _completed(command, stdout=_gc_export_record(command[-1], title=None))
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    report = gc_sessions(dry_run=False, idle_minutes=10, runner=runner, now=now)
+    assert report.deleted == 0
+    assert report.skipped_unknown == 1
+    assert report.skipped_unknown_ids == ["20260612_120000_dddd01"]
+
+
+def test_gc_sessions_cli_dry_run_by_default(monkeypatch, capsys):
+    now = 1_000_000.0
+    deleted: list[str] = []
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: {})
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:4] == ["hermes", "sessions", "list", "--source"]:
+            return _completed(
+                command,
+                stdout=_gc_list_output([{"id": "20260612_120000_aaaa01", "last_active": "30m ago"}]),
+            )
+        if command[:3] == ["hermes", "sessions", "export"]:
+            return _completed(command, stdout=_gc_export_record(command[-1], last_message_at=now - 1800))
+        if command[:3] == ["hermes", "sessions", "delete"]:
+            deleted.append(command[-1])
+            return _completed(command, stdout=f"Deleted session '{command[-1]}'.\n")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    def fake_gc_sessions(**kwargs):
+        return gc_sessions(runner=runner, now=now, **kwargs)
+
+    monkeypatch.setattr(cli, "gc_sessions", fake_gc_sessions)
+    assert cli.main(["gc", "--sessions"]) == 0
+    out = capsys.readouterr().out
+    assert "dry_run=True" in out
+    assert "deleted=1" in out
+    assert deleted == []
+
+
+def test_parse_relative_last_active():
+    now = 1_700_000_000.0
+    assert parse_relative_last_active("just now", now=now) == now
+    assert parse_relative_last_active("5m ago", now=now) == now - 300
+    assert parse_relative_last_active("?", now=now) is None
+
 
 def test_capture_uses_bounded_limit():
     """Assert session-capture uses a bounded --limit (newest-N) not full unbounded list."""
