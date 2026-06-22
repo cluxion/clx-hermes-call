@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from cluxion_hermes_call import __version__
 from cluxion_hermes_call.cli import add_call_arguments, options_from_namespace
@@ -28,6 +29,62 @@ def register(ctx: object) -> None:
         _handle_call_command,
         description="Use Hermes Agent like an AI API / codex-exec subprocess wrapper.",
     )
+
+    register_command = getattr(ctx, "register_command", None)
+    if callable(register_command):
+
+        def _slash_hermes_call(raw_args: str) -> str:
+            prompt = raw_args.strip()
+            if not prompt:
+                return "Usage: /hermes-call <prompt>"
+            from cluxion_hermes_call.cli import options_from_namespace
+
+            options = options_from_namespace(
+                argparse.Namespace(
+                    prompt=prompt,
+                    prompt_alias=None,
+                    model=None,
+                    ask=False,
+                    cd=str(Path.cwd()),
+                    sandbox=False,
+                    json=False,
+                    timeout=600.0,
+                    until_done=False,
+                    max_iterations=8,
+                    keep_session=False,
+                    toolsets=None,
+                ),
+                stdin=sys.stdin,
+                parser=argparse.ArgumentParser(prog="hermes call"),
+            )
+            result = run_call(options)
+            return result.answer or f"(exit {result.exit_code})"
+
+        def _slash_hermes_call_doctor(raw_args: str) -> str:
+            del raw_args
+            from importlib.resources import files
+
+            catalog_path = files("cluxion_hermes_call.doctor") / "catalog.json"
+            result = framework_run_doctor(
+                cwd=Path.cwd(),
+                catalog_path=Path(str(catalog_path)),
+                probes=PROBES,
+                plugin="hermes-call",
+                version=__version__,
+            )
+            return render_json(result)
+
+        register_command(
+            "hermes-call",
+            _slash_hermes_call,
+            description="One-shot Hermes prompt (codex-exec style)",
+            args_hint="<prompt>",
+        )
+        register_command(
+            "hermes-call-doctor",
+            _slash_hermes_call_doctor,
+            description="Run hermes-call plugin doctor checks",
+        )
 
 
 def _setup_call_parser(parser: argparse.ArgumentParser) -> None:
