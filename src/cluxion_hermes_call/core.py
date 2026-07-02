@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import difflib
 import os
 import re
@@ -232,6 +234,7 @@ def _run_hermes_process_with_prompt(
     except OSError as exc:
         return HermesProcessResult(stdout="", stderr=f"failed to start hermes: {exc}", returncode=1, timed_out=False)
 
+    _register_child(process.pid)
     try:
         stdout, stderr = process.communicate(timeout=timeout)
         if resume_session_id is not None:
@@ -242,6 +245,8 @@ def _run_hermes_process_with_prompt(
         if resume_session_id is not None:
             stdout = _strip_chat_query_preamble(stdout)
         return HermesProcessResult(stdout=stdout, stderr=stderr, returncode=124, timed_out=True)
+    finally:
+        _unregister_child(process.pid)
 
 
 def _build_hermes_command(
@@ -530,6 +535,52 @@ def _until_done_exit_code(*, status: str, process_result: HermesProcessResult) -
     if process_result.returncode != 0:
         return 1
     return 0 if status == "complete" else 1
+
+
+_live_processes: set[int] = set()
+_signal_hooks_installed = False
+
+
+def _register_child(pid: int) -> None:
+    """Track the child's process group so parent death cannot orphan it.
+
+    start_new_session=True detaches hermes from our signals on purpose (we
+    manage its lifetime), which also means Ctrl-C on hermes-call alone would
+    leave the group running forever. SIGINT/SIGTERM/atexit now reap it.
+    """
+    global _signal_hooks_installed
+    _live_processes.add(pid)
+    if _signal_hooks_installed:
+        return
+    _signal_hooks_installed = True
+    atexit.register(_reap_live_processes)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous = signal.getsignal(signum)
+
+        def _handler(signo: int, frame: object, _previous=previous) -> None:
+            _reap_live_processes()
+            if callable(_previous):
+                _previous(signo, frame)
+            else:
+                signal.signal(signo, signal.SIG_DFL)
+                os.kill(os.getpid(), signo)
+
+        # Non-main thread or exotic host: atexit still covers normal exits.
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(signum, _handler)
+
+
+def _unregister_child(pid: int) -> None:
+    _live_processes.discard(pid)
+
+
+def _reap_live_processes() -> None:
+    for pid in sorted(_live_processes):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+    _live_processes.clear()
 
 
 def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
