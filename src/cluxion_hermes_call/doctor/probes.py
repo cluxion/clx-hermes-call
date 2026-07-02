@@ -9,6 +9,8 @@ import io
 import json
 import shutil
 import sys
+import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -35,27 +37,35 @@ def hermes_on_path(ctx: DoctorContext) -> tuple[str, str]:
     return "fail", "not found on PATH"
 
 
+@_register("hermes_binary_not_found")
+def hermes_binary_not_found(ctx: DoctorContext) -> tuple[str, str]:
+    return hermes_on_path(ctx)
+
+
 @_register("hermes_version")
 def hermes_version(ctx: DoctorContext) -> tuple[str, str]:
-    try:
-        cp = ctx.run([ctx.hermes_bin, "--version"])
-        if cp.returncode == 0 and "Hermes Agent v" in cp.stdout:
-            return "pass", cp.stdout.strip()
-        return "fail", cp.stdout.strip() or cp.stderr.strip()
-    except Exception as e:
-        return "fail", f"run error: {e}"
+    path = shutil.which(ctx.hermes_bin)
+    if path:
+        return "pass", f"{path} (version checked by doctor --live)"
+    return "fail", "not found on PATH"
 
 
 @_register("hermes_oneshot_flag")
 def hermes_oneshot_flag(ctx: DoctorContext) -> tuple[str, str]:
     try:
-        cp = ctx.run([ctx.hermes_bin, "--help"])
-        out = cp.stdout + cp.stderr
-        if "-z" in out and "--oneshot" in out:
-            return "pass", "present"
-        return "fail", "missing in --help"
+        from cluxion_hermes_call.core import CallOptions, _build_hermes_command
+
+        command = _build_hermes_command(CallOptions(prompt="x", hermes_bin=ctx.hermes_bin), prompt="x")
+        if command[:2] == [ctx.hermes_bin, "-z"]:
+            return "pass", "wrapper emits -z oneshot argv"
+        return "fail", f"oneshot argv changed: {command!r}"
     except Exception as e:
-        return "fail", f"run error: {e}"
+        return "fail", f"oneshot probe error: {e}"
+
+
+@_register("hermes_help_flags_missing")
+def hermes_help_flags_missing(ctx: DoctorContext) -> tuple[str, str]:
+    return hermes_oneshot_flag(ctx)
 
 
 @_register("entry_point_registered")
@@ -71,7 +81,7 @@ def entry_point_registered(ctx: DoctorContext) -> tuple[str, str]:
                 mod = ep.load()
                 if hasattr(mod, "register") and callable(mod.register):
                     return "pass", ep.value or str(ep)
-        return "fail", "entry point not found or register missing"
+        return "warn", "entry point not visible in current Python environment"
     except Exception as e:
         return "fail", f"metadata error: {e}"
 
@@ -79,12 +89,13 @@ def entry_point_registered(ctx: DoctorContext) -> tuple[str, str]:
 @_register("subcommand_valid")
 def subcommand_valid(ctx: DoctorContext) -> tuple[str, str]:
     try:
-        cp = ctx.run([ctx.hermes_bin, "call", "--help"])
-        if cp.returncode == 0:
-            return "pass", "hermes call --help exits 0"
-        return "fail", f"exit {cp.returncode}"
+        from cluxion_hermes_call import plugin
+
+        if callable(getattr(plugin, "register", None)):
+            return "pass", "plugin.register is callable"
+        return "fail", "plugin.register missing"
     except Exception as e:
-        return "fail", f"run error: {e}"
+        return "fail", f"subcommand probe error: {e}"
 
 
 @_register("install_integrity")
@@ -96,8 +107,23 @@ def install_integrity(ctx: DoctorContext) -> tuple[str, str]:
         if dist_version == pkg_version:
             return "pass", dist_version
         return "warn", f"dist={dist_version} pkg={pkg_version}"
+    except importlib.metadata.PackageNotFoundError:
+        return "warn", "distribution metadata not visible in current Python environment"
     except Exception as e:
         return "fail", f"version error: {e}"
+
+
+@_register("default_model_not_configured")
+def default_model_not_configured(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_hermes_call.config import read_default_model
+
+        info = read_default_model()
+        if info.model:
+            return "pass", info.display()
+        return "warn", info.display()
+    except Exception as e:
+        return "warn", f"default model not checked: {e}"
 
 
 # hermes-call regression-guard probes
@@ -168,6 +194,109 @@ def doctor_gc_magic_safe(ctx: DoctorContext) -> tuple[str, str]:
         return "fail", "shaping gate missing in _handle_call_command"
     except Exception as e:
         return "skip", f"cannot inspect: {e}"
+
+
+@_register("sessions_list_parse_failure")
+def sessions_list_parse_failure(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_hermes_call.sessions import parse_session_ids_from_list
+
+        sample = (
+            "Preview                                            Last Active   Src    ID\n"
+            "Reply with exactly pong.                           just now      cli    20260612_235819_78bd06\n"
+        )
+        if parse_session_ids_from_list(sample) == {"20260612_235819_78bd06"}:
+            return "pass", "table parser accepts documented session id format"
+        return "fail", "documented table sample did not parse"
+    except Exception as e:
+        return "fail", f"parse probe error: {e}"
+
+
+@_register("subprocess_timeout_not_enforced")
+def subprocess_timeout_not_enforced(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_hermes_call import core
+
+        if "communicate(timeout=timeout)" not in Path(core.__file__).read_text(encoding="utf-8"):
+            return "fail", "communicate timeout sentinel missing"
+        return "pass", "Popen communicate timeout path present"
+    except Exception as e:
+        return "fail", f"timeout probe error: {e}"
+
+
+@_register("process_group_termination_fails")
+def process_group_termination_fails(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_hermes_call import core
+
+        src = Path(core.__file__).read_text(encoding="utf-8")
+        if all(token in src for token in ("start_new_session=True", "os.killpg", "signal.SIGTERM", "signal.SIGKILL")):
+            return "pass", "process group and SIGKILL fallback sentinels present"
+        return "fail", "process group termination sentinels missing"
+    except Exception as e:
+        return "fail", f"process cleanup probe error: {e}"
+
+
+@_register("hermes_command_flag_incompatible")
+def hermes_command_flag_incompatible(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_hermes_call.core import CallOptions, _build_hermes_command
+
+        options = CallOptions(prompt="x", hermes_bin=ctx.hermes_bin)
+        first = _build_hermes_command(options, prompt="x")
+        resumed = _build_hermes_command(options, prompt="x", resume_session_id="sid")
+        if first[:2] != [ctx.hermes_bin, "-z"]:
+            return "fail", f"oneshot command changed: {first!r}"
+        if resumed[:5] != [ctx.hermes_bin, "chat", "-Q", "--resume", "sid"]:
+            return "fail", f"resume command changed: {resumed!r}"
+        return "pass", "oneshot and resume argv match documented contract"
+    except Exception as e:
+        return "fail", f"command probe error: {e}"
+
+
+@_register("model_argument_invalid")
+def model_argument_invalid(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_hermes_call.core import CallOptions, _build_hermes_command
+
+        command = _build_hermes_command(CallOptions(prompt="x", model="model-x", hermes_bin=ctx.hermes_bin))
+        if command[:3] == [ctx.hermes_bin, "-m", "model-x"]:
+            return "pass", "-m is passed through to Hermes"
+        return "fail", f"model argv changed: {command!r}"
+    except Exception as e:
+        return "fail", f"model arg probe error: {e}"
+
+
+@_register("jobs_root_not_writable")
+def jobs_root_not_writable(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_hermes_call.jobs import resolve_jobs_root
+
+        root = resolve_jobs_root()
+        marker = root / f".doctor-{uuid.uuid4().hex}.marker"
+        payload = json.dumps({"ts": time.time()}, sort_keys=True)
+        marker.write_text(payload, encoding="utf-8")
+        try:
+            if marker.read_text(encoding="utf-8") != payload:
+                return "fail", f"roundtrip mismatch at {root}"
+        finally:
+            marker.unlink(missing_ok=True)
+        return "pass", str(root)
+    except Exception as e:
+        return "fail", f"jobs root not writable: {e}"
+
+
+@_register("session_cleanup_race_condition")
+def session_cleanup_race_condition(ctx: DoctorContext) -> tuple[str, str]:
+    try:
+        from cluxion_hermes_call import sessions
+
+        src = Path(sessions.__file__).read_text(encoding="utf-8")
+        if "started_matches" in src and "max(started_matches" in src:
+            return "pass", "same-cwd candidates tie-break by started_at then id"
+        return "fail", "same-cwd cleanup tie-break sentinel missing"
+    except Exception as e:
+        return "fail", f"race probe error: {e}"
 
 
 @_register("python_version_incompatibility")

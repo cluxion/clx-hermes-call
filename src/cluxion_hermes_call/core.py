@@ -236,6 +236,8 @@ def _run_hermes_process_with_prompt(
 
     _register_child(process.pid)
     try:
+        # CPython communicate() drains stdout/stderr together, so a chatty
+        # child cannot pipe-deadlock us while we wait for process exit.
         stdout, stderr = process.communicate(timeout=timeout)
         if resume_session_id is not None:
             stdout = _strip_chat_query_preamble(stdout)

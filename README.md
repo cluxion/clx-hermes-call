@@ -59,14 +59,17 @@ hermes-call doctor
 ```
 
 폴더에서 직접 입력하는 프롬프트와 정확히 동일하게 실행됩니다 — 같은 모델, 같은 도구, 같은 `AGENTS.md`
-규칙. 매 실행이 만든 세션은 실행 후 삭제됩니다(`--keep-session`으로 보존 가능). 기본 모드는 파일을
-수정할 수 있으므로(Hermes의 oneshot 모드처럼 도구를 자동 승인), 완전히 신뢰하지 않는 프롬프트에는
-`--ask`나 `--sandbox`를 사용하세요.
+규칙. 매 실행이 만든 세션은 실행 후 삭제를 시도합니다(`--keep-session`으로 보존 가능). 세션 식별이
+모호하거나, Hermes list/export/delete가 실패하거나, timeout/error 경로에 걸리면 안전하게 삭제를 건너뛰고
+이유를 보고할 수 있습니다. 남은 untitled CLI 세션은 `hermes-call gc --sessions`로 dry-run 확인 후
+`hermes-call gc --sessions --apply`로 정리하세요. 기본 모드는 파일을 수정할 수 있으므로(Hermes의
+oneshot 모드처럼 도구를 자동 승인), 완전히 신뢰하지 않는 프롬프트에는 `--ask`나 `--sandbox`를 사용하세요.
 
-`--until-done`은 프롬프트 끝에 완료 계약을 덧붙입니다. Hermes가 답변 마지막 줄을 `TASK_COMPLETE`로
-끝내면 완료로 보고, `WORK_REMAINS: ...`로 끝내면 같은 세션을 resume해서 이어갑니다. 완료 감지는
-모델의 자기 보고에 의존하므로 완벽하지 않습니다. `--max-iterations`, `--timeout`, 세션 id 식별 실패
-중 하나에 걸리면 `status=incomplete`로 정직하게 반환합니다.
+`--until-done`은 프롬프트 끝에 완료 계약을 덧붙입니다. 마지막 non-empty 줄이 공백과 대소문자를 무시해
+`TASK_COMPLETE`이면 완료로 보고, `WORK_REMAINS: ...`이면 같은 세션을 resume해서 이어갑니다. marker는
+마지막 줄에만 의미가 있으며 본문 중간의 같은 문자열은 무시됩니다. 완료 감지는 모델의 자기 보고에
+의존하므로 완벽하지 않습니다. `--max-iterations`, `--timeout`, 세션 id 식별 실패 중 하나에 걸리면
+`status=incomplete`로 정직하게 반환합니다.
 
 현재 로컬 Hermes에서는 `hermes -r <id> -z ...`가 실제 resume을 하지 않는 것으로 검증되었습니다.
 그래서 첫 실행은 clean stdout을 위해 `hermes -z`를 쓰고, 이어달리기는 검증된
@@ -161,15 +164,19 @@ hermes-call doctor
 ```
 
 It runs exactly the prompt you'd type yourself in that folder — same model, tools, and
-`AGENTS.md` rules. The session it creates is deleted after each run (use `--keep-session` to
-keep it). The default mode can modify files (it auto-approves tools, like Hermes' own oneshot
-mode), so use `--ask` (answer-only, no tools) or `--sandbox` for prompts you don't fully trust.
+`AGENTS.md` rules. The session it creates is cleaned up best-effort and fail-closed after each
+run (use `--keep-session` to keep it). Ambiguous session selection, Hermes list/export/delete
+failures, timeout paths, and error paths can leave sessions behind. Inspect stale untitled CLI
+sessions with `hermes-call gc --sessions`, then delete them with `hermes-call gc --sessions --apply`.
+The default mode can modify files (it auto-approves tools, like Hermes' own oneshot mode), so use
+`--ask` (answer-only, no tools) or `--sandbox` for prompts you don't fully trust.
 
-`--until-done` appends a completion contract to the prompt. If Hermes ends its answer with
-`TASK_COMPLETE`, the run is complete. If it ends with `WORK_REMAINS: ...`, `hermes-call`
-resumes the same session and continues. This detection depends on model self-reporting, so it
-is not proof of real completion. `--max-iterations`, `--timeout`, and session-id ambiguity all
-return `status=incomplete` honestly.
+`--until-done` appends a completion contract to the prompt. If the last non-empty answer line is
+`TASK_COMPLETE` after trimming whitespace and ignoring case, the run is complete. If that final
+line starts with `WORK_REMAINS: ...` after the same normalization, `hermes-call` resumes the same
+session and continues. Markers only count on the final line; the same text in the body is ignored.
+This detection depends on model self-reporting, so it is not proof of real completion.
+`--max-iterations`, `--timeout`, and session-id ambiguity all return `status=incomplete` honestly.
 
 On the local verified Hermes build, `hermes -r <id> -z ...` did not actually resume. The wrapper
 therefore uses `hermes -z` for the first clean oneshot, then the verified

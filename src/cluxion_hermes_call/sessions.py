@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import sqlite3
 import subprocess
 import time
 from collections.abc import Callable
@@ -45,6 +47,7 @@ class SessionMetadata:
     session_id: str
     model: str | None = None
     cwd: str | None = None
+    started_at: float | None = None
     error: str | None = None
 
 
@@ -249,6 +252,7 @@ def fetch_session_metadata(
                 session_id=session_id,
                 model=str(model) if model else None,
                 cwd=str(cwd) if cwd else None,
+                started_at=_coerce_timestamp(data.get("started_at")),
             )
     return SessionMetadata(session_id=session_id, error="missing_export_record")
 
@@ -275,6 +279,10 @@ def select_session_by_exported_cwd(
     matches = [item for item in metadata if _normalize_cwd(item.cwd) == normalized_expected]
     if len(matches) == 1:
         match = matches[0]
+        return SessionSelection(match.session_id, match.model, None)
+    started_matches = [item for item in matches if item.started_at is not None]
+    if started_matches:
+        match = max(started_matches, key=lambda item: (item.started_at or 0.0, item.session_id))
         return SessionSelection(match.session_id, match.model, None)
     return SessionSelection(None, None, f"cwd_match_count:{len(matches)}")
 
@@ -545,6 +553,10 @@ def _load_rich_cli_sessions(
     runner: CommandRunner,
     list_limit: int,
 ) -> dict[str, dict[str, Any]]:
+    rich = _load_sqlite_cli_sessions(list_limit=list_limit)
+    if rich is not None:
+        return rich
+
     db = _try_open_session_db()
     if db is None:
         return {}
@@ -557,6 +569,67 @@ def _load_rich_cli_sessions(
         if callable(close):
             close()
     return {str(item["id"]): item for item in sessions if item.get("id")}
+
+
+def _load_sqlite_cli_sessions(*, list_limit: int) -> dict[str, dict[str, Any]] | None:
+    path = _session_db_path()
+    if path is None or not path.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            session_columns = _table_columns(con, "sessions")
+            message_columns = _table_columns(con, "messages")
+            required = {"id", "source", "title", "ended_at", "started_at"}
+            if not required.issubset(session_columns) or not {"session_id", "timestamp"}.issubset(message_columns):
+                return None
+            rows = con.execute(
+                """
+                select
+                    s.id,
+                    s.source,
+                    s.title,
+                    s.ended_at,
+                    coalesce(max(m.timestamp), s.started_at) as last_active
+                from sessions s
+                left join messages m on m.session_id = s.id
+                where s.source = ?
+                group by s.id
+                order by last_active desc, s.id desc
+                limit ?
+                """,
+                ("cli", list_limit),
+            ).fetchall()
+        finally:
+            con.close()
+    except (OSError, sqlite3.Error):
+        return None
+    return {
+        str(row["id"]): {
+            "id": row["id"],
+            "source": row["source"],
+            "title": row["title"],
+            "ended_at": row["ended_at"],
+            "last_active": row["last_active"],
+        }
+        for row in rows
+        if row["id"]
+    }
+
+
+def _session_db_path() -> Path | None:
+    hermes_home = os.environ.get("HERMES_HOME")
+    if hermes_home:
+        return Path(hermes_home).expanduser() / "state.db"
+    home = Path.home()
+    if not str(home):
+        return None
+    return home / ".hermes" / "state.db"
+
+
+def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row["name"]) for row in con.execute(f"pragma table_info({table})")}
 
 
 def _try_open_session_db() -> Any | None:

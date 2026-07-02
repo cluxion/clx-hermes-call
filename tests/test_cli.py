@@ -6,6 +6,7 @@ import argparse
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import time
 
@@ -18,6 +19,7 @@ from cluxion_hermes_call.doctor.framework import CheckResult, DoctorResult
 from cluxion_hermes_call.jobs import MARKER_FILE, create_job, delete_job_dir, gc_jobs
 from cluxion_hermes_call.sessions import (
     SessionCleanupReport,
+    SessionGcReport,
     SessionSnapshot,
     cleanup_created_session,
     gc_sessions,
@@ -311,6 +313,44 @@ def test_session_cleanup_keeps_ambiguous_exported_cwd_matches(tmp_path):
     assert report.cleaned is False
     assert report.reason == "multiple_new_sessions:2;cwd_match_count:2"
     assert not any(command[:3] == ["hermes", "sessions", "delete"] for command in calls)
+
+
+def test_session_cleanup_tiebreaks_same_cwd_by_started_at(tmp_path):
+    calls: list[list[str]] = []
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        if command[:3] == ["hermes", "sessions", "export"]:
+            session_id = command[-1]
+            started_at = 999.0 if session_id == "20260612_120000_bbbb02" else 990.0
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps(
+                    {
+                        "id": session_id,
+                        "model": "grok-4.3",
+                        "cwd": str(tmp_path),
+                        "started_at": started_at,
+                    }
+                )
+                + "\n",
+                "",
+            )
+        if command[:3] == ["hermes", "sessions", "delete"]:
+            return subprocess.CompletedProcess(command, 0, f"Deleted session '{command[-1]}'.\n", "")
+        return subprocess.CompletedProcess(command, 99, "", "unexpected")
+
+    report = cleanup_created_session(
+        SessionSnapshot(frozenset({"a"})),
+        SessionSnapshot(frozenset({"a", "20260612_120000_aaaa01", "20260612_120000_bbbb02"})),
+        runner=runner,
+        expected_cwd=tmp_path,
+    )
+
+    assert report.cleaned is True
+    assert report.session_id == "20260612_120000_bbbb02"
+    assert ["hermes", "sessions", "delete", "--yes", "20260612_120000_bbbb02"] in calls
 
 
 def test_session_cleanup_keeps_when_candidate_export_fails(tmp_path):
@@ -842,6 +882,38 @@ def test_gc_sessions_skips_list_when_rich_present(monkeypatch):
     assert deleted == [session_id]
 
 
+def test_gc_sessions_reads_sqlite_db_without_list_or_exports(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "create table sessions ("
+        "id text primary key, source text, title text, ended_at real, started_at real, cwd text)"
+    )
+    con.execute("create table messages (session_id text, timestamp real)")
+    con.execute(
+        "insert into sessions (id, source, title, ended_at, started_at, cwd) values (?, ?, ?, ?, ?, ?)",
+        ("20260612_120000_aaaa01", "cli", None, None, 1_000_000.0 - 1800, str(tmp_path)),
+    )
+    con.execute(
+        "insert into messages (session_id, timestamp) values (?, ?)",
+        ("20260612_120000_aaaa01", 1_000_000.0 - 1800),
+    )
+    con.commit()
+    con.close()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls: list[list[str]] = []
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        raise AssertionError(f"unexpected subprocess: {command!r}")
+
+    report = gc_sessions(dry_run=True, idle_minutes=10, runner=runner, now=1_000_000.0)
+
+    assert report.deleted == 1
+    assert report.deleted_ids == ["20260612_120000_aaaa01"]
+    assert calls == []
+
+
 def test_gc_sessions_rich_and_list_paths_same_decisions(monkeypatch):
     now = 1_000_000.0
     session_id = "20260612_120000_aaaa01"
@@ -934,6 +1006,31 @@ def test_gc_sessions_cli_dry_run_by_default(monkeypatch, capsys):
     assert "dry_run=True" in out
     assert "deleted=1" in out
     assert deleted == []
+
+
+def test_gc_sessions_cli_list_failure_exits_2_for_dry_run_and_apply(monkeypatch, capsys):
+    def fake_gc_sessions(**kwargs):
+        report = SessionGcReport(dry_run=kwargs["dry_run"])
+        report.error = "list_failed:boom"
+        return report
+
+    monkeypatch.setattr(cli, "gc_sessions", fake_gc_sessions)
+
+    assert cli.main(["gc", "--sessions"]) == 2
+    captured = capsys.readouterr()
+    assert (
+        captured.out
+        == "sessions dry_run=True deleted=0 kept_named=0 skipped_recent=0 skipped_unknown=0 failed=0 optimized=False\n"
+    )
+    assert "list_failed:boom" in captured.err
+
+    assert cli.main(["gc", "--sessions", "--apply"]) == 2
+    captured = capsys.readouterr()
+    assert (
+        captured.out
+        == "sessions dry_run=False deleted=0 kept_named=0 skipped_recent=0 skipped_unknown=0 failed=0 optimized=False\n"
+    )
+    assert "list_failed:boom" in captured.err
 
 
 def test_parse_relative_last_active():

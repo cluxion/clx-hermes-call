@@ -474,7 +474,7 @@
     "likely_causes": [
       "Hermes adds trailing whitespace or blank lines after marker",
       "Hermes outputs marker on non-final line (model emits marker mid-response)",
-      "Marker case is different (Task_Complete, task_complete)",
+      "Marker is not on the final non-empty line",
       "WORK_REMAINS: prefix is followed by newline instead of on same line",
       "Hermes response is truncated by timeout before final line"
     ],
@@ -485,7 +485,7 @@
       "Check marker regex: grep -n 'TASK_COMPLETE_MARKER\\|WORK_REMAINS_PREFIX' src/cluxion_hermes_call/core.py",
       "Verify parse logic: _parse_completion_marker() in core.py (strips whitespace, checks last non-empty line)"
     ],
-    "change_robust": "Parser strips trailing whitespace and empty lines; checks only final non-empty line; handles case-sensitive exact match; detects prefix match for WORK_REMAINS; fails gracefully with status='incomplete' if no marker",
+    "change_robust": "Parser strips trailing whitespace and empty lines; checks only final non-empty line; ignores marker case; detects prefix match for WORK_REMAINS; fails gracefully with status='incomplete' if no marker",
     "detection_method": "Run hermes-call --until-done with prompt that ends in 'TASK_COMPLETE' or 'WORK_REMAINS: X'; parse last line of output; verify marker is extracted; status is 'complete' or 'incomplete'"
   },
   {

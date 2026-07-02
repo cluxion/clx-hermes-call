@@ -98,7 +98,7 @@ def load_catalog(catalog_path: Path) -> tuple[CatalogEntry, ...]:
             elif val is not None:
                 data[f] = val
         if "check_id" in data:
-            entries.append(CatalogEntry(**data))  # type: ignore[arg-type]
+            entries.append(CatalogEntry(**data))
     return tuple(entries)
 
 

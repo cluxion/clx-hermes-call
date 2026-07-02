@@ -124,9 +124,6 @@ def _main_gc(argv: list[str]) -> int:
             idle_minutes=ns.idle_minutes,
             optimize=not ns.no_optimize,
         )
-        if report.error:
-            print(report.error, file=sys.stderr)
-            return 1
         print(
             "sessions "
             f"dry_run={report.dry_run} "
@@ -137,6 +134,9 @@ def _main_gc(argv: list[str]) -> int:
             f"failed={report.failed} "
             f"optimized={report.optimized}"
         )
+        if report.error:
+            print(report.error, file=sys.stderr)
+            return 2
         return 0 if report.failed == 0 else 1
 
     removed, kept = gc_jobs()
