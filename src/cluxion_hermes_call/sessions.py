@@ -19,6 +19,8 @@ SESSION_ID_AT_EOL_RE = re.compile(r"(?P<id>\d{8}_\d{6}_[0-9a-fA-F]+)\s*$")
 # Fixed column widths from `hermes sessions list` table header (Preview / Last Active / Src / ID).
 _LIST_PREVIEW_WIDTH = 50
 _LIST_LAST_ACTIVE_WIDTH = 13
+_SESSION_COMMAND_TIMEOUT_ENV = "CLUXION_HERMES_CALL_SESSION_TIMEOUT"
+_DEFAULT_SESSION_COMMAND_TIMEOUT = 30.0
 
 
 @dataclass(frozen=True)
@@ -96,7 +98,47 @@ CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
 
 def default_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a Hermes session-management command."""
-    return subprocess.run(command, text=True, capture_output=True, check=False)
+    from cluxion_hermes_call.core import (
+        _register_child,
+        _terminate_process_group,
+        _termination_grace,
+        _unregister_child,
+    )
+
+    timeout = _session_command_timeout()
+    process = subprocess.Popen(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    _register_child(process.pid)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode or 0, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _terminate_process_group(process, grace_seconds=_termination_grace(timeout))
+        return subprocess.CompletedProcess(command, 124, stdout, _with_timeout_message(stderr, timeout))
+    finally:
+        _unregister_child(process.pid)
+
+
+def _session_command_timeout() -> float:
+    raw = os.environ.get(_SESSION_COMMAND_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_SESSION_COMMAND_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        return _DEFAULT_SESSION_COMMAND_TIMEOUT
+    return timeout if timeout > 0 else _DEFAULT_SESSION_COMMAND_TIMEOUT
+
+
+def _with_timeout_message(stderr: str, timeout: float) -> str:
+    message = f"session command timed out after {timeout:g}s"
+    return f"{stderr}\n{message}" if stderr else message
 
 
 def capture_session_ids(

@@ -30,5 +30,9 @@ Verified on 2026-06-14 against the local `hermes` binary on PATH. Re-check with
 - Continuation uses the verified local path `hermes chat -Q --resume <owned-id> -q ...`, not `hermes -r <id> -z ...`.
 - Cleanup is still fail-closed: only the selected owned session id is deleted, and `--keep-session` preserves it.
 - If `hermes sessions list` fails during `gc --sessions`, `hermes-call` prints the failure on stderr, prints the zero-delete summary, and exits 2 in both dry-run and `--apply`.
+- Session snapshot/GC subprocesses are tracked like model subprocesses and time out after 30s by default. Override with `CLUXION_HERMES_CALL_SESSION_TIMEOUT`.
+- `--json` usage/input errors write `{ok:false,error,message,hint,exit_code}` to stdout and exit 2.
+- Prompts with null bytes are rejected as `invalid_prompt`; prompts of 256KB or more are rejected as `prompt_too_large` before spawn because the verified Hermes path is still `-z PROMPT` argv passthrough.
+- `--timeout` is capped at 86400s. After timeout, process-group termination waits `min(5, max(0.5, timeout * 0.5))`, so worst-case wall time is about timeout plus that grace.
 - Completion detection is not a proof. A model can emit `TASK_COMPLETE` incorrectly. Caps, timeout, and honest `status=incomplete` reporting are the safety net.
 - `--ask` still maps to `-t context_engine`. Hermes does not expose a no-tools discovery command, so `doctor` documents the dependency and `doctor --live` verifies behavior by asking for a tool action and expecting `NO_TOOLS`.

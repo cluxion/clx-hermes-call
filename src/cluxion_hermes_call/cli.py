@@ -10,7 +10,7 @@ from typing import TextIO
 
 from cluxion_hermes_call import __version__
 from cluxion_hermes_call.config import default_model_help_line
-from cluxion_hermes_call.core import CallOptions, CallResult, run_call
+from cluxion_hermes_call.core import MAX_TIMEOUT_SECONDS, CallOptions, CallResult, run_call
 from cluxion_hermes_call.doctor.framework import (
     DoctorResult,
     render_json,
@@ -23,6 +23,25 @@ from cluxion_hermes_call.doctor.live import live_checks
 from cluxion_hermes_call.doctor.probes import PROBES
 from cluxion_hermes_call.jobs import gc_jobs
 from cluxion_hermes_call.sessions import gc_sessions
+
+
+class UsageError(Exception):
+    def __init__(self, message: str, *, error: str = "usage_error", hint: str) -> None:
+        super().__init__(message)
+        self.error = error
+        self.message = message
+        self.hint = hint
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args: object, json_errors: bool = False, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.json_errors = json_errors
+
+    def error(self, message: str) -> None:
+        if self.json_errors:
+            raise UsageError(message, hint=f"Run `{self.prog} --help` for valid arguments.")
+        super().error(message)
 
 
 def add_call_arguments(parser: argparse.ArgumentParser) -> None:
@@ -54,9 +73,9 @@ def add_call_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-V", "--version", action="store_true", help="Show version and exit")
 
 
-def build_call_parser(prog: str = "hermes-call") -> argparse.ArgumentParser:
+def build_call_parser(prog: str = "hermes-call", *, json_errors: bool = False) -> argparse.ArgumentParser:
     """Build the main hermes-call parser."""
-    parser = argparse.ArgumentParser(prog=prog, epilog=default_model_help_line())
+    parser = JsonArgumentParser(prog=prog, epilog=default_model_help_line(), json_errors=json_errors)
     add_call_arguments(parser)
     return parser
 
@@ -85,9 +104,9 @@ def build_gc_parser(prog: str = "hermes-call gc") -> argparse.ArgumentParser:
     return parser
 
 
-def build_doctor_parser(prog: str = "hermes-call doctor") -> argparse.ArgumentParser:
+def build_doctor_parser(prog: str = "hermes-call doctor", *, json_errors: bool = False) -> argparse.ArgumentParser:
     """Build the doctor subcommand parser."""
-    parser = argparse.ArgumentParser(prog=prog)
+    parser = JsonArgumentParser(prog=prog, json_errors=json_errors)
     parser.add_argument("--json", action="store_true", help="Print framework JSON to stdout")
     parser.add_argument("--live", action="store_true", help="Run one tiny live --ask model round-trip")
     parser.add_argument("--timeout", type=float, default=120.0, help="Live check timeout in seconds (default: 120)")
@@ -145,11 +164,16 @@ def _main_gc(argv: list[str]) -> int:
 
 
 def _main_doctor(argv: list[str]) -> int:
-    parser = build_doctor_parser()
+    parser = build_doctor_parser(json_errors="--json" in argv)
     try:
         ns = parser.parse_args(argv)
         if ns.timeout <= 0:
             parser.error("--timeout must be greater than 0")
+        if ns.timeout > MAX_TIMEOUT_SECONDS:
+            parser.error(f"--timeout must be at most {int(MAX_TIMEOUT_SECONDS)}")
+    except UsageError as exc:
+        _write_error_json(error=exc.error, message=exc.message, hint=exc.hint, exit_code=2)
+        return 2
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
     if ns.version:
@@ -191,13 +215,16 @@ def _main_doctor(argv: list[str]) -> int:
 
 
 def _main_call(argv: list[str], *, stdin: TextIO) -> int:
-    parser = build_call_parser()
+    parser = build_call_parser(json_errors="--json" in argv)
     try:
         ns = parser.parse_args(argv)
         if ns.version:
             print(f"hermes-call {__version__}")
             return 0
         options = options_from_namespace(ns, stdin=stdin, parser=parser)
+    except UsageError as exc:
+        _write_error_json(error=exc.error, message=exc.message, hint=exc.hint, exit_code=2)
+        return 2
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
@@ -216,6 +243,8 @@ def options_from_namespace(
     prompt = _resolve_prompt(ns.prompt, ns.prompt_alias, stdin=stdin, parser=parser)
     if ns.timeout <= 0:
         parser.error("--timeout must be greater than 0")
+    if ns.timeout > MAX_TIMEOUT_SECONDS:
+        parser.error(f"--timeout must be at most {int(MAX_TIMEOUT_SECONDS)}")
     if ns.max_iterations <= 0:
         parser.error("--max-iterations must be greater than 0")
     if ns.keep and not ns.sandbox:
@@ -272,6 +301,16 @@ def _write_result(result: CallResult, *, json_mode: bool) -> None:
         sys.stdout.write(result.answer)
         if not result.answer.endswith("\n"):
             sys.stdout.write("\n")
+
+
+def _write_error_json(*, error: str, message: str, hint: str, exit_code: int) -> None:
+    print(
+        json.dumps(
+            {"ok": False, "error": error, "message": message, "hint": hint, "exit_code": exit_code},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
 
 
 if __name__ == "__main__":

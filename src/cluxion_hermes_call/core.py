@@ -40,6 +40,9 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|token|secret|password)(\s*[=:]\s*)(\S+)"),
     re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
 ]
+MAX_PROMPT_BYTES = 256 * 1024
+MAX_TIMEOUT_SECONDS = 86_400.0
+_KILL_DRAIN_TIMEOUT_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,9 @@ class CallResult:
     iterations: int | None = None
     work_log: tuple[str, ...] = ()
     last_work_remains: str | None = None
+    error: str | None = None
+    message: str | None = None
+    hint: str | None = None
 
     def to_json_object(self) -> dict[str, object]:
         """Return the stable JSON result object."""
@@ -113,6 +119,12 @@ class CallResult:
             payload["work_log"] = list(self.work_log)
         if self.last_work_remains is not None:
             payload["last_work_remains"] = self.last_work_remains
+        if self.error is not None:
+            payload["error"] = self.error
+        if self.message is not None:
+            payload["message"] = self.message
+        if self.hint is not None:
+            payload["hint"] = self.hint
         return payload
 
 
@@ -128,8 +140,65 @@ def _sandbox_error_result(exc: JobRootUnwritableError) -> CallResult:
     )
 
 
+def _structured_error_result(*, error: str, message: str, hint: str, exit_code: int = 2) -> CallResult:
+    return CallResult(
+        ok=False,
+        answer=message,
+        model=None,
+        duration_ms=0,
+        session_cleaned=False,
+        exit_code=exit_code,
+        status=error,
+        error=error,
+        message=message,
+        hint=hint,
+    )
+
+
+def validate_call_options(options: CallOptions) -> CallResult | None:
+    """Return a structured user error before any subprocess is started."""
+    if "\0" in options.prompt:
+        return _structured_error_result(
+            error="invalid_prompt",
+            message="PROMPT contains a null byte and cannot be passed to Hermes.",
+            hint="Pass text input only; binary data must be encoded or stored in a file and summarized.",
+        )
+    prompt = _wrap_until_done_prompt(options.prompt) if options.until_done else options.prompt
+    if options.ask:
+        prompt = ASK_MODE_PREFACE + prompt
+    prompt_bytes = len(prompt.encode("utf-8"))
+    if prompt_bytes >= MAX_PROMPT_BYTES:
+        return _structured_error_result(
+            error="prompt_too_large",
+            message=f"PROMPT is too large ({prompt_bytes} bytes).",
+            hint=f"Limit is {MAX_PROMPT_BYTES} bytes because Hermes prompt passthrough uses argv; split the task or point Hermes at a file.",
+        )
+    if options.timeout_seconds <= 0:
+        return _structured_error_result(
+            error="invalid_timeout",
+            message="--timeout must be greater than 0.",
+            hint=f"Use a value between 0 and {int(MAX_TIMEOUT_SECONDS)} seconds.",
+        )
+    if options.timeout_seconds > MAX_TIMEOUT_SECONDS:
+        return _structured_error_result(
+            error="invalid_timeout",
+            message=f"--timeout must be at most {int(MAX_TIMEOUT_SECONDS)} seconds.",
+            hint="Use a bounded run and resume with --resume or --until-done if more work remains.",
+        )
+    if options.max_iterations <= 0:
+        return _structured_error_result(
+            error="invalid_max_iterations",
+            message="--max-iterations must be greater than 0.",
+            hint="Use a positive integer.",
+        )
+    return None
+
+
 def run_call(options: CallOptions) -> CallResult:
     """Run Hermes once, clean up its session and sandbox when safe."""
+    validation_error = validate_call_options(options)
+    if validation_error is not None:
+        return validation_error
     if options.until_done:
         return _run_until_done_call(options)
 
@@ -231,8 +300,8 @@ def _run_hermes_process_with_prompt(
             text=True,
             start_new_session=True,
         )
-    except OSError as exc:
-        return HermesProcessResult(stdout="", stderr=f"failed to start hermes: {exc}", returncode=1, timed_out=False)
+    except (OSError, ValueError) as exc:
+        return HermesProcessResult(stdout="", stderr=f"failed to start hermes: {exc}", returncode=2, timed_out=False)
 
     _register_child(process.pid)
     try:
@@ -243,7 +312,7 @@ def _run_hermes_process_with_prompt(
             stdout = _strip_chat_query_preamble(stdout)
         return HermesProcessResult(stdout=stdout, stderr=stderr, returncode=process.returncode or 0, timed_out=False)
     except subprocess.TimeoutExpired:
-        stdout, stderr = _terminate_process_group(process)
+        stdout, stderr = _terminate_process_group(process, grace_seconds=_termination_grace(timeout))
         if resume_session_id is not None:
             stdout = _strip_chat_query_preamble(stdout)
         return HermesProcessResult(stdout=stdout, stderr=stderr, returncode=124, timed_out=True)
@@ -585,7 +654,11 @@ def _reap_live_processes() -> None:
     _live_processes.clear()
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
+def _termination_grace(timeout_seconds: float) -> float:
+    return min(5.0, max(0.5, timeout_seconds * 0.5))
+
+
+def _terminate_process_group(process: subprocess.Popen[str], *, grace_seconds: float = 5.0) -> tuple[str, str]:
     stderr_chunks: list[str] = []
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -594,7 +667,7 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
     except OSError as exc:
         stderr_chunks.append(f"failed to terminate hermes process group {process.pid}: {exc}")
     try:
-        stdout, stderr = process.communicate(timeout=5)
+        stdout, stderr = process.communicate(timeout=grace_seconds)
         return stdout or "", _join_stderr(stderr, stderr_chunks)
     except subprocess.TimeoutExpired:
         try:
@@ -604,7 +677,7 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> tuple[str, str]:
         except OSError as exc:
             stderr_chunks.append(f"failed to kill hermes process group {process.pid}: {exc}")
         try:
-            stdout, stderr = process.communicate(timeout=5)
+            stdout, stderr = process.communicate(timeout=_KILL_DRAIN_TIMEOUT_SECONDS)
             return stdout or "", _join_stderr(stderr, stderr_chunks)
         except subprocess.TimeoutExpired:
             stderr_chunks.append(f"hermes process group {process.pid} did not exit after SIGKILL")
@@ -621,6 +694,8 @@ def _map_exit_code(process_result: HermesProcessResult) -> int:
         return 124
     if process_result.returncode == 0:
         return 0
+    if process_result.returncode == 2:
+        return 2
     return 1
 
 

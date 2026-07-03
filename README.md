@@ -75,6 +75,14 @@ oneshot 모드처럼 도구를 자동 승인), 완전히 신뢰하지 않는 프
 그래서 첫 실행은 clean stdout을 위해 `hermes -z`를 쓰고, 이어달리기는 검증된
 `hermes chat -Q --resume <id> -q ...` 경로를 사용합니다.
 
+`--json` 모드의 사용법/입력 오류는 stdout에 `{ok:false,error,message,hint,exit_code}` JSON을 쓰고
+exit 2로 종료합니다. 프롬프트의 null byte는 `invalid_prompt`, 256KB 이상 프롬프트는
+`prompt_too_large`로 spawn 전에 거부합니다. `--timeout`은 최대 86400초이며, timeout 후 종료 대기
+최악치는 대략 `timeout + min(5, max(0.5, timeout * 0.5))`입니다.
+
+세션 snapshot/GC용 `hermes sessions ...` subprocess도 추적/정리되며 기본 30초 timeout을 가집니다.
+필요하면 `CLUXION_HERMES_CALL_SESSION_TIMEOUT`으로 조정할 수 있습니다.
+
 Python 자동화에서는 import 시 모델 호출이 없습니다.
 
 ```python
@@ -181,6 +189,14 @@ This detection depends on model self-reporting, so it is not proof of real compl
 On the local verified Hermes build, `hermes -r <id> -z ...` did not actually resume. The wrapper
 therefore uses `hermes -z` for the first clean oneshot, then the verified
 `hermes chat -Q --resume <id> -q ...` path for continuation.
+
+In `--json` mode, usage/input errors write `{ok:false,error,message,hint,exit_code}` JSON to stdout
+and exit 2. Null bytes are rejected as `invalid_prompt`, and prompts of 256KB or more are rejected
+as `prompt_too_large` before spawning Hermes. `--timeout` is capped at 86400 seconds; timeout
+worst-case is about `timeout + min(5, max(0.5, timeout * 0.5))`.
+
+Session snapshot/GC `hermes sessions ...` subprocesses are tracked and have a default 30 second
+timeout. Override it with `CLUXION_HERMES_CALL_SESSION_TIMEOUT` when needed.
 
 Python automation performs no model call at import time:
 

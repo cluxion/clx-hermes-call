@@ -22,6 +22,7 @@ from cluxion_hermes_call.sessions import (
     SessionGcReport,
     SessionSnapshot,
     cleanup_created_session,
+    default_runner,
     gc_sessions,
     parse_relative_last_active,
     parse_session_ids_from_list,
@@ -66,6 +67,63 @@ def test_stdin_prompt_and_json_shape(monkeypatch, capsys):
         "session_cleaned": True,
         "exit_code": 0,
     }
+
+
+@pytest.mark.parametrize(
+    ("argv", "error"),
+    [
+        (["--json", "--prompt", ""], "usage_error"),
+        (["--json", "--timeout", "-1", "hi"], "usage_error"),
+        (["--json", "--max-iterations", "-1", "hi"], "usage_error"),
+    ],
+)
+def test_json_usage_errors_are_json(argv, error, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "run_call", lambda options: pytest.fail("run_call should not start"))
+
+    assert cli.main(argv) == 2
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["error"] == error
+    assert payload["message"]
+    assert payload["hint"]
+    assert captured.err == ""
+
+
+def test_json_timeout_upper_bound_error_does_not_start(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "run_call", lambda options: pytest.fail("run_call should not start"))
+
+    assert cli.main(["--json", "--timeout", "999999999", "hi"]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error"] == "usage_error"
+    assert "86400" in payload["message"]
+
+
+def test_json_rejects_null_byte_prompt_before_spawn(capsys):
+    assert cli.main(["--json", "--prompt", "bad\0prompt", "--keep-session"]) == 2
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["ok"] is False
+    assert payload["error"] == "invalid_prompt"
+    assert "null byte" in payload["message"]
+    assert captured.err == ""
+
+
+def test_oversize_prompt_is_rejected_before_spawn(monkeypatch):
+    monkeypatch.setattr(core.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("Popen should not start"))
+
+    result = run_call(CallOptions(prompt="x" * (256 * 1024), keep_session=True))
+
+    assert result.ok is False
+    assert result.exit_code == 2
+    assert result.status == "prompt_too_large"
+    payload = result.to_json_object()
+    assert payload["error"] == "prompt_too_large"
+    assert "262144" in payload["hint"]
 
 
 def test_prompt_alias(monkeypatch, capsys):
@@ -445,6 +503,29 @@ def test_timeout_kills_fake_hermes_process(tmp_path):
     assert result.exit_code == 124
 
 
+def test_timeout_grace_scales_with_requested_timeout(monkeypatch):
+    timeouts: list[float | None] = []
+
+    class SlowProcess:
+        pid = 12345
+        returncode = None
+
+        def communicate(self, timeout=None):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                raise subprocess.TimeoutExpired(["fake"], timeout)
+            self.returncode = 124
+            return "", ""
+
+    monkeypatch.setattr(core.subprocess, "Popen", lambda *args, **kwargs: SlowProcess())
+    monkeypatch.setattr(core.os, "killpg", lambda pid, sig: None)
+
+    result = run_call(CallOptions(prompt="slow", timeout_seconds=0.5, keep_session=True))
+
+    assert result.exit_code == 124
+    assert timeouts == [0.5, 0.5]
+
+
 def test_terminate_process_group_has_sigkill_communicate_timeout(monkeypatch):
     class StubbornProcess:
         pid = 12345
@@ -462,6 +543,25 @@ def test_terminate_process_group_has_sigkill_communicate_timeout(monkeypatch):
     assert stdout == ""
     assert process.calls == 2
     assert "did not exit after SIGKILL" in stderr
+
+
+def test_session_default_runner_times_out_and_returns_completed_process(monkeypatch):
+    class SlowProcess:
+        pid = 12345
+        returncode = None
+
+        def communicate(self, timeout=None):
+            raise subprocess.TimeoutExpired(["hermes"], timeout)
+
+    monkeypatch.setenv("CLUXION_HERMES_CALL_SESSION_TIMEOUT", "0.5")
+    monkeypatch.setattr("cluxion_hermes_call.sessions.subprocess.run", lambda *a, **k: pytest.fail("use Popen"))
+    monkeypatch.setattr("cluxion_hermes_call.sessions.subprocess.Popen", lambda *a, **k: SlowProcess())
+    monkeypatch.setattr(core.os, "killpg", lambda pid, sig: None)
+
+    completed = default_runner(["hermes", "sessions", "list"])
+
+    assert completed.returncode == 124
+    assert "timed out after 0.5s" in completed.stderr
 
 
 def test_until_done_loops_until_task_complete(monkeypatch):
