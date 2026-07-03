@@ -65,6 +65,9 @@ hermes-call doctor
 `hermes-call gc --sessions --apply`로 정리하세요. 기본 모드는 파일을 수정할 수 있으므로(Hermes의
 oneshot 모드처럼 도구를 자동 승인), 완전히 신뢰하지 않는 프롬프트에는 `--ask`나 `--sandbox`를 사용하세요.
 
+> Note: the completion contract (`TASK_COMPLETE` / `WORK_REMAINS:`) is sent to Hermes only in `--until-done` mode. Plain one-shot calls return the raw answer with no `status` field; any marker-like text in a one-shot answer comes from the model itself and is preserved verbatim.
+
+
 `--until-done`은 프롬프트 끝에 완료 계약을 덧붙입니다. 마지막 non-empty 줄이 공백과 대소문자를 무시해
 `TASK_COMPLETE`이면 완료로 보고, `WORK_REMAINS: ...`이면 같은 세션을 resume해서 이어갑니다. marker는
 마지막 줄에만 의미가 있으며 본문 중간의 같은 문자열은 무시됩니다. 완료 감지는 모델의 자기 보고에

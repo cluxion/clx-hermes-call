@@ -9,6 +9,6 @@ from cluxion_hermes_call.api import PostHermes, PostHermesError
 try:
     __version__ = version("cluxion-hermes-call-cli")
 except PackageNotFoundError:  # pragma: no cover
-    __version__ = "0.3.12"
+    __version__ = "0.3.13"
 
 __all__ = ["PostHermes", "PostHermesError", "__version__"]
