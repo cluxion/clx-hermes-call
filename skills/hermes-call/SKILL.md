@@ -28,6 +28,6 @@ hermes-call --json --until-done --max-iterations 8 --prompt "<prompt>"
 Rules:
 
 1. Keep model selection on the CLI with `-m`.
-2. Let `hermes-call` own session detection, cleanup, and resume behavior; it follows the verified Hermes CLI contract in `docs/hermes-cli-contract.md`.
+2. Let `hermes-call` own session detection, cleanup, and resume behavior per its verified Hermes CLI contract.
 3. Treat `status="incomplete"` as incomplete work and report the reason honestly.
 4. Never claim checks or edits were run unless the JSON result and host-side verification show they were run.
