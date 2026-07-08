@@ -401,7 +401,14 @@ def gc_sessions(
                 for session_id in remaining
             }
             for future in as_completed(futures):
-                metadata_by_id[futures[future]] = future.result()
+                session_id = futures[future]
+                try:
+                    metadata_by_id[session_id] = future.result()
+                except Exception as exc:
+                    metadata_by_id[session_id] = SessionGcMetadata(
+                        session_id=session_id,
+                        error=f"gc metadata failed: {type(exc).__name__}: {exc}",
+                    )
 
     for session_id in remaining:
         metadata = metadata_by_id[session_id]
@@ -549,7 +556,11 @@ def _resolve_session_gc_metadata(
         if last_active is None:
             messages = exported.get("messages") or []
             if messages:
-                timestamps = [_coerce_timestamp(item.get("timestamp")) for item in messages]
+                timestamps = [
+                    _coerce_timestamp(item.get("timestamp"))
+                    for item in messages
+                    if isinstance(item, dict)
+                ]
                 known = [item for item in timestamps if item is not None]
                 last_active = max(known) if known else None
         if last_active is None and list_row is not None:
