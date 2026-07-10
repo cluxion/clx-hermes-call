@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from cluxion_hermes_call.core import sanitize_diagnostic
+from cluxion_hermes_call import core
+from cluxion_hermes_call.core import CallOptions, HermesProcessResult, sanitize_diagnostic
+from cluxion_hermes_call.sessions import SessionCleanupReport
 
 # labelless known-prefix keys must be scrubbed from diagnostics (they slipped through
 # the labeled api_key=/bearer patterns before). Assembled from split literals so this
@@ -96,3 +98,40 @@ def test_partial_prompt_secret_overlap_omits_body_and_tail(
     assert secret_body not in out, f"secret body leaked: {out!r}"
     assert customer_tail not in out, f"customer tail leaked: {out!r}"
     assert "[prompt omitted]" in out, f"expected [prompt omitted]: {out!r}"
+
+
+def test_emit_diagnostics_sanitizes_cleanup_reason_sentinel(capsys) -> None:
+    """SessionCleanupReport.reason must be scrubbed (not only child stderr)."""
+    sentinel = "SUPER_SECRET_PROMPT_TOKEN_XYZ_C98"
+    options = CallOptions(prompt=sentinel)
+    process_result = HermesProcessResult(stdout="", stderr="", returncode=1, timed_out=False)
+    cleanup_report = SessionCleanupReport(
+        cleaned=False,
+        reason=f"delete_failed: leaked {sentinel} during cleanup",
+    )
+
+    core._emit_diagnostics(
+        options=options,
+        process_result=process_result,
+        cleanup_report=cleanup_report,
+        exit_code=1,
+    )
+
+    err = capsys.readouterr().err
+    assert sentinel not in err
+    assert "session cleanup skipped" in err
+    assert "[prompt omitted]" in err
+
+
+def test_emit_diagnostics_keeps_static_exit_code_when_prompt_is_digit(capsys) -> None:
+    options = CallOptions(prompt="1")
+    core._emit_diagnostics(
+        options=options,
+        process_result=HermesProcessResult(stdout="", stderr="", returncode=1, timed_out=False),
+        cleanup_report=SessionCleanupReport(cleaned=True),
+        exit_code=1,
+    )
+
+    err = capsys.readouterr().err
+    assert "hermes exited with code 1" in err
+    assert "[prompt omitted]" not in err

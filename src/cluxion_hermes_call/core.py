@@ -214,6 +214,18 @@ def validate_call_options(options: CallOptions) -> CallResult | None:
             message="--max-iterations must be greater than 0.",
             hint="Use a positive integer.",
         )
+    if options.cwd is not None and "\0" in str(options.cwd):
+        return _structured_error_result(
+            error="invalid_cwd",
+            message="cwd contains a null byte and cannot be used as a working directory.",
+            hint="Pass a filesystem path without embedded NUL bytes.",
+        )
+    if "\0" in options.hermes_bin:
+        return _structured_error_result(
+            error="invalid_hermes_bin",
+            message="hermes_bin contains a null byte and cannot be executed.",
+            hint="Pass a binary name or path without embedded NUL bytes.",
+        )
     return None
 
 
@@ -260,7 +272,7 @@ def run_call(options: CallOptions) -> CallResult:
     job_deleted: bool | None = None
     if job is not None:
         if ok and not options.keep_job:
-            decision = delete_job_dir(job.root)
+            decision = delete_job_dir(job.root, jobs_root=job.root.parent)
             job_deleted = decision.allowed
             if not decision.allowed:
                 _diagnose(f"sandbox cleanup skipped: {decision.reason}; job_dir={job.root}")
@@ -319,6 +331,8 @@ def _run_hermes_process_with_prompt(
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             start_new_session=True,
         )
     except (OSError, ValueError) as exc:
@@ -611,7 +625,7 @@ def _cleanup_job(job: Job | None, *, ok: bool, keep_job: bool) -> bool | None:
     if job is None:
         return None
     if ok and not keep_job:
-        decision = delete_job_dir(job.root)
+        decision = delete_job_dir(job.root, jobs_root=job.root.parent)
         if not decision.allowed:
             _diagnose(f"sandbox cleanup skipped: {decision.reason}; job_dir={job.root}")
         return decision.allowed
@@ -736,7 +750,12 @@ def _emit_diagnostics(
         _diagnose(sanitize_diagnostic(process_result.stderr, prompt=options.prompt))
 
     if not cleanup_report.cleaned and cleanup_report.reason not in {None, "keep_session", "no_new_session"}:
-        _diagnose(f"session cleanup skipped: {cleanup_report.reason}")
+        _diagnose(
+            sanitize_diagnostic(
+                f"session cleanup skipped: {cleanup_report.reason}",
+                prompt=options.prompt,
+            )
+        )
 
 
 def sanitize_diagnostic(text: str, *, prompt: str) -> str:
@@ -746,9 +765,7 @@ def sanitize_diagnostic(text: str, *, prompt: str) -> str:
     spans: list[tuple[int, int, str, bool]] = []
     for pattern in SECRET_PATTERNS:
         for match in pattern.finditer(text):
-            replacement = (
-                f"{match.group(1)}{match.group(2) if len(match.groups()) > 1 else ''}[redacted]"
-            )
+            replacement = f"{match.group(1)}{match.group(2) if len(match.groups()) > 1 else ''}[redacted]"
             spans.append((match.start(), match.end(), replacement, False))
     if prompt:
         # Non-overlapping exact occurrences (same as str.replace-all semantics).

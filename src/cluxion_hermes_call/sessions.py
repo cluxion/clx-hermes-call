@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -109,6 +110,8 @@ def default_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         command,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         stdin=subprocess.DEVNULL,
@@ -131,9 +134,11 @@ def _session_command_timeout() -> float:
         return _DEFAULT_SESSION_COMMAND_TIMEOUT
     try:
         timeout = float(raw)
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         return _DEFAULT_SESSION_COMMAND_TIMEOUT
-    return timeout if timeout > 0 else _DEFAULT_SESSION_COMMAND_TIMEOUT
+    if not math.isfinite(timeout) or timeout <= 0:
+        return _DEFAULT_SESSION_COMMAND_TIMEOUT
+    return timeout
 
 
 def _with_timeout_message(stderr: str, timeout: float) -> str:
@@ -554,11 +559,7 @@ def _resolve_session_gc_metadata(
         if last_active is None:
             messages = exported.get("messages") or []
             if messages:
-                timestamps = [
-                    _coerce_timestamp(item.get("timestamp"))
-                    for item in messages
-                    if isinstance(item, dict)
-                ]
+                timestamps = [_coerce_timestamp(item.get("timestamp")) for item in messages if isinstance(item, dict)]
                 known = [item for item in timestamps if item is not None]
                 last_active = max(known) if known else None
         if last_active is None and list_row is not None:
@@ -723,7 +724,7 @@ def _short_error(text: str, *, max_len: int = 300) -> str:
 def _run_session_command(command: list[str], *, runner: CommandRunner) -> subprocess.CompletedProcess[str]:
     try:
         return runner(command)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return subprocess.CompletedProcess(command, 127, "", str(exc))
 
 

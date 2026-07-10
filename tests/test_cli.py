@@ -1266,3 +1266,97 @@ def test_capture_uses_bounded_limit():
     capture_session_ids(runner=fake_runner, limit=20)
     list_cmds2 = [c for c in captured_cmds if "sessions" in c and "list" in c]
     assert any("--limit" in c and int(c[c.index("--limit") + 1]) == 20 for c in list_cmds2)
+
+
+# --- Cycle 98 HC fixes ---
+
+
+@pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "+inf", "-inf", "Infinity", "-Infinity"])
+def test_session_command_timeout_non_finite_falls_back_to_30s(monkeypatch, raw):
+    monkeypatch.setenv("CLUXION_HERMES_CALL_SESSION_TIMEOUT", raw)
+    from cluxion_hermes_call.sessions import _DEFAULT_SESSION_COMMAND_TIMEOUT, _session_command_timeout
+
+    assert _session_command_timeout() == _DEFAULT_SESSION_COMMAND_TIMEOUT
+    assert _session_command_timeout() == 30.0
+
+
+def test_hermes_popen_decodes_byte_0xff_with_replace(tmp_path):
+    fake = tmp_path / "fake-hermes"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\xff-out')\n"
+        "sys.stderr.buffer.write(b'\\xff-err')\n"
+        "sys.stdout.buffer.flush()\n"
+        "sys.stderr.buffer.flush()\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    result = run_call(
+        CallOptions(
+            prompt="hi",
+            hermes_bin=str(fake),
+            keep_session=True,
+            timeout_seconds=5.0,
+        )
+    )
+
+    assert "\ufffd" in result.answer
+    assert result.exit_code == 0
+
+
+def test_session_popen_decodes_byte_0xff_with_replace(tmp_path, monkeypatch):
+    fake = tmp_path / "fake-hermes-session"
+    fake.write_text(
+        "#!/usr/bin/env python3\nimport sys\nsys.stdout.buffer.write(b'ok\\xff\\n')\nsys.stdout.buffer.flush()\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+
+    completed = default_runner([str(fake)])
+    assert completed.returncode == 0
+    assert "\ufffd" in completed.stdout
+
+
+def test_nul_in_cwd_rejected_before_popen_or_session_capture(monkeypatch):
+    monkeypatch.setattr(core.subprocess, "Popen", lambda *a, **k: pytest.fail("Popen should not start"))
+    monkeypatch.setattr(core, "capture_session_ids", lambda **k: pytest.fail("capture_session_ids should not run"))
+
+    result = run_call(CallOptions(prompt="hi", cwd=Path("/tmp/bad\0cwd")))
+
+    assert result.ok is False
+    assert result.exit_code == 2
+    assert result.error == "invalid_cwd"
+    assert result.status == "invalid_cwd"
+    assert "null" in (result.message or "").lower()
+    payload = result.to_json_object()
+    assert payload["error"] == "invalid_cwd"
+    assert payload["message"]
+    assert payload["hint"]
+
+
+def test_nul_in_hermes_bin_rejected_before_popen_or_session_capture(monkeypatch):
+    monkeypatch.setattr(core.subprocess, "Popen", lambda *a, **k: pytest.fail("Popen should not start"))
+    monkeypatch.setattr(core, "capture_session_ids", lambda **k: pytest.fail("capture_session_ids should not run"))
+
+    result = run_call(CallOptions(prompt="hi", hermes_bin="hermes\0evil"))
+
+    assert result.ok is False
+    assert result.exit_code == 2
+    assert result.error == "invalid_hermes_bin"
+    assert result.status == "invalid_hermes_bin"
+    assert "null" in (result.message or "").lower()
+    payload = result.to_json_object()
+    assert payload["error"] == "invalid_hermes_bin"
+
+
+def test_run_session_command_catches_value_error_before_side_effects():
+    from cluxion_hermes_call.sessions import _run_session_command
+
+    def boom(command):
+        raise ValueError("embedded null byte or invalid argument")
+
+    completed = _run_session_command(["hermes", "sessions", "list"], runner=boom)
+    assert completed.returncode == 127
+    assert "null" in completed.stderr.lower() or "invalid" in completed.stderr.lower()

@@ -30,7 +30,9 @@ def resolve_jobs_root() -> Path:
     """Pick a writable jobs root: env override, then home, then workspace-local."""
     override = os.environ.get(HOME_ENV, "").strip()
     candidates = (
-        [Path(override).expanduser() / "jobs"] if override else [DEFAULT_JOBS_ROOT, Path.cwd() / ".hermes-call" / "jobs"]
+        [Path(override).expanduser() / "jobs"]
+        if override
+        else [DEFAULT_JOBS_ROOT, Path.cwd() / ".hermes-call" / "jobs"]
     )
     errors: list[str] = []
     for candidate in candidates:
@@ -123,10 +125,20 @@ def can_delete_job_dir(job_dir: Path, *, jobs_root: Path = DEFAULT_JOBS_ROOT) ->
     return DeleteDecision(True, "pid_dead")
 
 
-def gc_jobs(*, jobs_root: Path = DEFAULT_JOBS_ROOT, now: float | None = None) -> tuple[int, int]:
-    """Prune marked job directories older than 24 hours."""
+def gc_jobs(*, jobs_root: Path | None = None, now: float | None = None) -> tuple[int, int]:
+    """Prune marked job directories older than 24 hours.
+
+    When ``jobs_root`` is omitted, resolve the live writable root. If root
+    preparation raises ``JobRootUnwritableError``, return ``(0, 0)`` without crashing.
+    """
     now = time.time() if now is None else now
-    root = jobs_root.expanduser()
+    if jobs_root is None:
+        try:
+            root = resolve_jobs_root()
+        except JobRootUnwritableError:
+            return 0, 0
+    else:
+        root = jobs_root.expanduser()
     if not root.exists():
         return 0, 0
 

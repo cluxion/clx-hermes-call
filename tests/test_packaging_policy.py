@@ -36,6 +36,8 @@ def _locked_project_version(lock: dict[str, object], package_name: str) -> str |
             version = package.get("version")
             return str(version) if version is not None else None
     return None
+
+
 def test_marketplace_manifest_is_version_synced() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     version = pyproject["project"]["version"]
