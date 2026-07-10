@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -40,6 +41,30 @@ def test_version_flag(capsys):
 def test_usage_error_returns_2(capsys):
     assert cli.main([]) == 2
     assert "PROMPT is required" in capsys.readouterr().err
+
+
+def test_slash_namespace_builds_call_options():
+    ns = argparse.Namespace(
+        prompt="hello",
+        prompt_alias=None,
+        model=None,
+        ask=False,
+        cwd=str(Path.cwd()),
+        sandbox=False,
+        json=False,
+        timeout=600.0,
+        until_done=False,
+        max_iterations=8,
+        keep_session=False,
+        keep=False,
+        toolsets=None,
+        resume_session=None,
+    )
+
+    assert isinstance(
+        cli.options_from_namespace(ns, stdin=io.StringIO(""), parser=argparse.ArgumentParser()),
+        CallOptions,
+    )
 
 
 def test_stdin_prompt_and_json_shape(monkeypatch, capsys):
