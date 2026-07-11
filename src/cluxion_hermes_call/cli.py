@@ -74,7 +74,7 @@ def add_call_arguments(parser: argparse.ArgumentParser) -> None:
         "--resume",
         dest="resume_session",
         metavar="SESSION_ID",
-        help="Resume an existing Hermes session (passed to hermes -r); the session is never garbage-collected",
+        help="Resume an existing Hermes session (hermes chat -Q --resume); the session is never garbage-collected",
     )
     parser.add_argument("-V", "--version", action="store_true", help="Show version and exit")
 

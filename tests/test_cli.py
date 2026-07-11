@@ -262,6 +262,13 @@ def test_help_prints_default_model_line(monkeypatch, capsys):
     assert "Default model: xai-oauth/grok-4.3" in capsys.readouterr().out
 
 
+def test_resume_help_names_verified_chat_resume_path() -> None:
+    parser = cli.build_call_parser()
+    resume_help = next(a.help for a in parser._actions if "--resume" in a.option_strings)
+    assert "hermes chat -Q --resume" in resume_help
+    assert "passed to hermes -r" not in resume_help
+
+
 def test_doctor_cli_json_shape_and_exit_zero(monkeypatch, capsys):
     result = DoctorResult(plugin="hermes-call", version="0.3.1", checks=())
 
