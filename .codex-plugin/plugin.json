@@ -1,5 +1,5 @@
 {
-  "name": "cluxion-hermes-call-cli",
+  "name": "clx-hermes-call",
   "version": "0.3.25",
   "description": "Delegate one-shot or bounded until-done work to the installed hermes-call CLI.",
   "author": {

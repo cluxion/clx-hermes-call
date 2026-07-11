@@ -28,7 +28,7 @@ hermes-call = "cluxion_hermes_call.cli:main"
 cluxion-hermes-call-cli = "cluxion_hermes_call.plugin"
 
 [project.urls]
-Repository = "https://github.com/cluxion/cluxion-Hermes-call-cli"
+Repository = "https://github.com/cluxion/clx-hermes-call.git"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cluxion_hermes_call"]

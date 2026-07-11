@@ -14,8 +14,9 @@ def test_root_plugin_artifacts_are_version_synced() -> None:
     codex = json.loads(Path(".codex-plugin/plugin.json").read_text(encoding="utf-8"))
 
     assert claude == codex
-    assert claude["name"] == "cluxion-hermes-call-cli"
+    assert claude["name"] == "clx-hermes-call"
     assert claude["version"] == version
+    # Python distribution name stays cluxion-hermes-call-cli (compat).
     assert _locked_project_version(lock, "cluxion-hermes-call-cli") == version
     assert claude["commands"] == "./commands"
     assert claude["skills"] == "./skills"
@@ -43,5 +44,7 @@ def test_marketplace_manifest_is_version_synced() -> None:
     version = pyproject["project"]["version"]
 
     marketplace = json.loads(Path(".claude-plugin/marketplace.json").read_text(encoding="utf-8"))
+    assert marketplace["name"] == "clx-hermes-call"
+    assert marketplace["plugins"][0]["name"] == "clx-hermes-call"
     assert marketplace["plugins"][0]["version"] == version
     assert marketplace["plugins"][0]["source"] == "./"

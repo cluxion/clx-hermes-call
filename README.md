@@ -2,7 +2,7 @@
 
 ======== 한국어 ========
 
-# cluxion-hermes-call-cli
+# clx-hermes-call
 
 Hermes Agent를 AI API처럼 사용하세요. `hermes-call`은 [Hermes Agent](https://hermes-agent.nousresearch.com)에
 이미 설정해 둔 모델에 프롬프트 하나를 보내 답을 받아오고 — codex exec 방식 — 자신이 만든 세션을
@@ -25,8 +25,8 @@ uv tool install cluxion-hermes-call-cli
 실행 가능해야 합니다.
 
 ```bash
-codex plugin marketplace add cluxion-local /path/to/cluxion-Hermes-call-cli
-codex plugin add cluxion-hermes-call-cli@cluxion-local
+codex plugin marketplace add cluxion-local /path/to/clx-hermes-call
+codex plugin add clx-hermes-call@cluxion-local
 ```
 
 Claude Code에서는 같은 repo root의 `.claude-plugin/plugin.json`을 플러그인으로 설치하세요. 두 host 모두
@@ -117,7 +117,7 @@ Apache-2.0
 
 ============ English ==========
 
-# cluxion-hermes-call-cli
+# clx-hermes-call
 
 Run your Hermes Agent like an AI API. `hermes-call` sends one prompt to the model you already
 configured in [Hermes Agent](https://hermes-agent.nousresearch.com), gives you the answer back
@@ -141,8 +141,8 @@ This repo root is the shared Codex/Claude marketplace plugin artifact. The CLI a
 available on the host PATH first.
 
 ```bash
-codex plugin marketplace add cluxion-local /path/to/cluxion-Hermes-call-cli
-codex plugin add cluxion-hermes-call-cli@cluxion-local
+codex plugin marketplace add cluxion-local /path/to/clx-hermes-call
+codex plugin add clx-hermes-call@cluxion-local
 ```
 
 In Claude Code, install the same repo root from `.claude-plugin/plugin.json`. Both hosts discover

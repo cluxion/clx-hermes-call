@@ -1,12 +1,12 @@
 {
-  "name": "cluxion-hermes-call",
+  "name": "clx-hermes-call",
   "description": "Cluxion agent plugins marketplace",
   "owner": {
     "name": "cluxion"
   },
   "plugins": [
     {
-      "name": "cluxion-hermes-call-cli",
+      "name": "clx-hermes-call",
       "description": "Delegation CLI: drive hermes oneshot/resume sessions from host agents.",
       "version": "0.3.25",
       "source": "./"
