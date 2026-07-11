@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
 from cluxion_hermes_call import __version__
 from cluxion_hermes_call.cli import add_call_arguments, options_from_namespace
 from cluxion_hermes_call.config import default_model_help_line
-from cluxion_hermes_call.core import run_call
+from cluxion_hermes_call.core import MAX_TIMEOUT_SECONDS, run_call
 from cluxion_hermes_call.doctor.framework import DoctorResult, render_json
 from cluxion_hermes_call.doctor.framework import run_doctor as framework_run_doctor
 from cluxion_hermes_call.doctor.live import live_checks
@@ -35,7 +36,8 @@ def register(ctx: object) -> None:
 
         def _slash_hermes_call(raw_args: str) -> str:
             prompt = raw_args.strip()
-            if not prompt:
+            # `-` is a slash-command placeholder, not stdin mode.
+            if not prompt or prompt == "-":
                 return "Usage: /hermes-call <prompt>"
             from cluxion_hermes_call.cli import options_from_namespace
 
@@ -48,7 +50,7 @@ def register(ctx: object) -> None:
                     cwd=str(Path.cwd()),
                     sandbox=False,
                     json=False,
-                    timeout=600.0,
+                    timeout=None,
                     until_done=False,
                     max_iterations=8,
                     keep_session=False,
@@ -115,6 +117,7 @@ def _handle_call_command(args: argparse.Namespace) -> int:
         from importlib.resources import files
         from pathlib import Path
 
+        timeout = _plugin_resolve_timeout(getattr(args, "timeout", None), default=120.0)
         catalog_path = files("cluxion_hermes_call.doctor") / "catalog.json"
         result = framework_run_doctor(
             cwd=Path.cwd(),
@@ -125,7 +128,7 @@ def _handle_call_command(args: argparse.Namespace) -> int:
         )
         live = getattr(args, "live", False)
         if live:
-            live_results = live_checks(getattr(args, "timeout", 120.0))
+            live_results = live_checks(timeout)
             result = DoctorResult(
                 plugin=result.plugin,
                 version=result.version,
@@ -157,3 +160,15 @@ def _handle_call_command(args: argparse.Namespace) -> int:
     if result.exit_code:
         raise SystemExit(result.exit_code)
     return result.exit_code
+
+
+def _plugin_resolve_timeout(raw: float | None, *, default: float) -> float:
+    """Branch-specific timeout default for hosted doctor/live; reject non-finite."""
+    timeout = default if raw is None else float(raw)
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > MAX_TIMEOUT_SECONDS:
+        print(
+            f"--timeout must be a finite number between 0 and {int(MAX_TIMEOUT_SECONDS)}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return timeout

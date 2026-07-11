@@ -17,9 +17,8 @@ from pathlib import Path
 from typing import Any
 
 SESSION_ID_AT_EOL_RE = re.compile(r"(?P<id>\d{8}_\d{6}_[0-9a-fA-F]+)\s*$")
-# Fixed column widths from `hermes sessions list` table header (Preview / Last Active / Src / ID).
-_LIST_PREVIEW_WIDTH = 50
-_LIST_LAST_ACTIVE_WIDTH = 13
+# Header column names for current and legacy `hermes sessions list` tables.
+_LIST_HEADER_COLUMNS = ("Title", "Preview", "Last Active", "Src", "ID")
 _SESSION_COMMAND_TIMEOUT_ENV = "CLUXION_HERMES_CALL_SESSION_TIMEOUT"
 _DEFAULT_SESSION_COMMAND_TIMEOUT = 30.0
 
@@ -459,26 +458,73 @@ def optimize_session_store(
 
 
 def parse_session_list_rows(output: str) -> list[dict[str, str]]:
-    """Parse session rows from `hermes sessions list` table output."""
+    """Parse session rows from `hermes sessions list` table output.
+
+    Supports both:
+    - current: Title / Preview / Last Active / ID
+    - legacy:  Preview / Last Active / Src / ID
+
+    Column offsets are derived from the header. When Src is absent (CLI-filtered
+    list), source defaults to ``cli``. Malformed output without a header is
+    fail-closed (empty list).
+    """
+    lines = output.splitlines()
+    header: dict[str, int] | None = None
+    header_idx = -1
+    for index, line in enumerate(lines):
+        parsed = _parse_list_header_offsets(line)
+        if parsed is not None:
+            header = parsed
+            header_idx = index
+            break
+    if header is None:
+        return []
+
+    ordered = sorted(header, key=header.__getitem__)
     rows: list[dict[str, str]] = []
-    last_active_start = _LIST_PREVIEW_WIDTH + 1
-    last_active_end = last_active_start + _LIST_LAST_ACTIVE_WIDTH
-    for line in output.splitlines():
+    for line in lines[header_idx + 1 :]:
+        stripped = line.strip()
+        if not stripped or set(stripped) <= {"─", "-", "━", " "}:
+            continue
         id_match = SESSION_ID_AT_EOL_RE.search(line)
         if not id_match:
             continue
         session_id = id_match.group("id")
-        last_active = "?"
-        if len(line) >= last_active_end:
-            value = line[last_active_start:last_active_end].strip()
-            if value:
-                last_active = value
-        source = "cli"
-        between = line[last_active_end : id_match.start()].strip()
-        if between:
-            source = between.split()[0]
-        rows.append({"id": session_id, "last_active": last_active, "source": source})
+        last_active = _column_slice(line, header, "Last Active", ordered) or "?"
+        if "Src" in header:
+            raw_source = _column_slice(line, header, "Src", ordered)
+            source = raw_source.split()[0] if raw_source else "cli"
+        else:
+            source = "cli"
+        row: dict[str, str] = {"id": session_id, "last_active": last_active, "source": source}
+        if "Title" in header:
+            row["title"] = _column_slice(line, header, "Title", ordered)
+        if "Preview" in header:
+            row["preview"] = _column_slice(line, header, "Preview", ordered)
+        rows.append(row)
     return rows
+
+
+def _parse_list_header_offsets(line: str) -> dict[str, int] | None:
+    found: dict[str, int] = {}
+    for name in _LIST_HEADER_COLUMNS:
+        idx = line.find(name)
+        if idx >= 0:
+            found[name] = idx
+    if "Last Active" not in found or "ID" not in found:
+        return None
+    if "Preview" not in found and "Title" not in found:
+        return None
+    return found
+
+
+def _column_slice(line: str, starts: dict[str, int], name: str, ordered: list[str]) -> str:
+    start = starts[name]
+    later = [starts[col] for col in ordered if starts[col] > start]
+    end = min(later) if later else len(line)
+    if start >= len(line):
+        return ""
+    return line[start : min(end, len(line))].strip()
 
 
 def parse_relative_last_active(value: str, *, now: float | None = None) -> float | None:
@@ -523,11 +569,12 @@ def _classify_session_for_gc(metadata: SessionGcMetadata, *, idle_seconds: float
         return "skipped_unknown"
     if _session_has_title(metadata.title):
         return "kept_named"
-    if metadata.ended_at is not None:
-        return "delete"
-    if metadata.last_active is None:
+    # ended_at is activity evidence (session finished then), not an immediate-delete marker.
+    activity_times = [stamp for stamp in (metadata.ended_at, metadata.last_active) if stamp is not None]
+    if not activity_times:
         return "skipped_unknown"
-    if now - metadata.last_active < idle_seconds:
+    activity = max(activity_times)
+    if now - activity < idle_seconds:
         return "skipped_recent"
     return "delete"
 
@@ -696,21 +743,27 @@ def _try_open_session_db() -> Any | None:
 
 
 def _coerce_timestamp(value: Any) -> float | None:
-    if value is None:
+    """Coerce session metadata timestamps; fail closed on non-finite/malformed values."""
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            stamp = float(value)
+        except OverflowError:
+            return None
+        return stamp if math.isfinite(stamp) else None
     if isinstance(value, str):
         text = value.strip()
         if not text:
             return None
         try:
-            return float(text)
+            stamp = float(text)
         except ValueError:
             try:
-                return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-            except ValueError:
+                stamp = datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            except (ValueError, OverflowError, OSError):
                 return None
+        return stamp if math.isfinite(stamp) else None
     return None
 
 

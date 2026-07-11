@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -330,10 +331,13 @@ def test_parse_session_list_rows_extracts_last_active_by_column():
             {"id": "20260612_235819_ad789f", "last_active": "30m ago", "preview": "Use a terminal command"},
         ]
     )
-    assert parse_session_list_rows(output) == [
-        {"id": "20260612_235819_78bd06", "last_active": "just now", "source": "cli"},
-        {"id": "20260612_235819_ad789f", "last_active": "30m ago", "source": "cli"},
+    rows = parse_session_list_rows(output)
+    assert [(row["id"], row["last_active"], row["source"]) for row in rows] == [
+        ("20260612_235819_78bd06", "just now", "cli"),
+        ("20260612_235819_ad789f", "30m ago", "cli"),
     ]
+    assert rows[0]["preview"] == "Reply with exactly pong."
+    assert rows[1]["preview"] == "Use a terminal command"
 
 
 def test_session_cleanup_deletes_exactly_one_new_id():
@@ -1360,3 +1364,418 @@ def test_run_session_command_catches_value_error_before_side_effects():
     completed = _run_session_command(["hermes", "sessions", "list"], runner=boom)
     assert completed.returncode == 127
     assert "null" in completed.stderr.lower() or "invalid" in completed.stderr.lower()
+
+
+# --- Cycle 99 HC fixes ---
+
+
+def test_coerce_timestamp_fail_closed_for_non_finite_bool_and_overflow():
+    from cluxion_hermes_call.sessions import _coerce_timestamp
+
+    assert _coerce_timestamp(float("nan")) is None
+    assert _coerce_timestamp(float("inf")) is None
+    assert _coerce_timestamp(float("-inf")) is None
+    assert _coerce_timestamp(True) is None
+    assert _coerce_timestamp(False) is None
+    assert _coerce_timestamp("nan") is None
+    assert _coerce_timestamp("inf") is None
+    assert _coerce_timestamp("not-a-timestamp") is None
+    # Extreme ISO year can overflow platform timestamp conversion.
+    assert _coerce_timestamp("999999-01-01T00:00:00") is None
+    # Huge ints overflow float(); numeric path must fail closed like string overflow.
+    assert _coerce_timestamp(10**400) is None
+    assert _coerce_timestamp(-(10**400)) is None
+    assert _coerce_timestamp(1_700_000_000.0) == 1_700_000_000.0
+    assert _coerce_timestamp("1700000000") == 1_700_000_000.0
+
+
+def test_gc_skips_delete_when_ended_at_non_finite(monkeypatch):
+    now = 1_000_000.0
+    session_id = "20260612_120000_ffff01"
+    deleted: list[str] = []
+    rich = {
+        session_id: {
+            "id": session_id,
+            "source": "cli",
+            "title": None,
+            "ended_at": float("nan"),
+            "last_active": None,
+        }
+    }
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: rich)
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:3] == ["hermes", "sessions", "delete"]:
+            deleted.append(command[-1])
+            return _completed(command, stdout=f"Deleted session '{command[-1]}'.\n")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    report = gc_sessions(dry_run=False, idle_minutes=10, runner=runner, now=now)
+    assert report.deleted == 0
+    assert report.skipped_unknown == 1
+    assert deleted == []
+
+
+def test_gc_skips_delete_when_ended_at_huge_int_overflow(monkeypatch):
+    """Destructive GC must not raise when metadata ints overflow float()."""
+    now = 1_000_000.0
+    session_pos = "20260612_120000_ffff02"
+    session_neg = "20260612_120000_ffff03"
+    deleted: list[str] = []
+    rich = {
+        session_pos: {
+            "id": session_pos,
+            "source": "cli",
+            "title": None,
+            "ended_at": 10**400,
+            "last_active": None,
+        },
+        session_neg: {
+            "id": session_neg,
+            "source": "cli",
+            "title": None,
+            "ended_at": -(10**400),
+            "last_active": None,
+        },
+    }
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: rich)
+
+    def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:3] == ["hermes", "sessions", "delete"]:
+            deleted.append(command[-1])
+            return _completed(command, stdout=f"Deleted session '{command[-1]}'.\n")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    report = gc_sessions(dry_run=False, idle_minutes=10, runner=runner, now=now)
+    assert report.deleted == 0
+    assert report.skipped_unknown == 2
+    assert deleted == []
+
+
+def test_parse_session_list_rows_current_title_preview_header():
+    output = (
+        "Title                          Preview                                            Last Active   ID\n"
+        "────────────────────────────────────────────────────────────────────────────────────────────────────────\n"
+        "My Session                     Reply with exactly pong.                           just now      20260612_235819_78bd06\n"
+        "                               untitled preview                                   30m ago       20260612_235819_ad789f\n"
+    )
+    rows = parse_session_list_rows(output)
+    assert rows == [
+        {
+            "id": "20260612_235819_78bd06",
+            "last_active": "just now",
+            "source": "cli",
+            "title": "My Session",
+            "preview": "Reply with exactly pong.",
+        },
+        {
+            "id": "20260612_235819_ad789f",
+            "last_active": "30m ago",
+            "source": "cli",
+            "title": "",
+            "preview": "untitled preview",
+        },
+    ]
+
+
+def test_parse_session_list_rows_legacy_preview_src_header():
+    output = (
+        "Preview                                            Last Active   Src    ID\n"
+        "───────────────────────────────────────────────────────────────────────────────────────────────\n"
+        "Reply with exactly pong.                           just now      cli    20260612_235819_78bd06\n"
+        "Use a terminal command                             30m ago       api    20260612_235819_ad789f\n"
+    )
+    rows = parse_session_list_rows(output)
+    assert rows[0]["id"] == "20260612_235819_78bd06"
+    assert rows[0]["last_active"] == "just now"
+    assert rows[0]["source"] == "cli"
+    assert rows[1]["source"] == "api"
+    assert rows[1]["last_active"] == "30m ago"
+
+
+def test_parse_session_list_rows_malformed_fail_closed():
+    # No usable header: rows with IDs still appear, but without header offsets they are skipped.
+    output = "garbage line 20260612_235819_78bd06\nnot a table\n"
+    assert parse_session_list_rows(output) == []
+
+
+def test_standalone_doctor_rejects_nan_timeout_before_probes(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "framework_run_doctor", lambda **kw: pytest.fail("doctor probes must not start"))
+    monkeypatch.setattr(cli, "live_checks", lambda t: pytest.fail("live checks must not start"))
+
+    assert cli.main(["doctor", "--timeout", "nan"]) == 2
+    err = capsys.readouterr().err
+    assert "timeout" in err.lower() or "finite" in err.lower() or "invalid" in err.lower()
+
+
+def test_standalone_doctor_rejects_nan_timeout_json(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "framework_run_doctor", lambda **kw: pytest.fail("doctor probes must not start"))
+    monkeypatch.setattr(cli, "live_checks", lambda t: pytest.fail("live checks must not start"))
+
+    assert cli.main(["doctor", "--json", "--timeout", "nan"]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["error"] == "usage_error"
+
+
+def test_plugin_doctor_live_defaults_timeout_to_120(monkeypatch):
+    seen: dict[str, float] = {}
+
+    def fake_framework_run_doctor(**kw):
+        return DoctorResult(plugin="hermes-call", version="0.3.22", checks=())
+
+    def fake_live(timeout):
+        seen["timeout"] = timeout
+        return []
+
+    monkeypatch.setattr(hermes_plugin, "framework_run_doctor", fake_framework_run_doctor)
+    monkeypatch.setattr(hermes_plugin, "live_checks", fake_live)
+
+    ns = argparse.Namespace(
+        version=False,
+        prompt="doctor",
+        prompt_alias=None,
+        json=False,
+        live=True,
+        timeout=None,
+        ask=False,
+        toolsets=None,
+        until_done=False,
+        sandbox=False,
+    )
+    assert hermes_plugin._handle_call_command(ns) == 0
+    assert seen["timeout"] == 120.0
+
+
+def test_plugin_ordinary_call_defaults_timeout_to_600(monkeypatch):
+    seen: dict[str, float] = {}
+
+    def fake_run_call(options: CallOptions) -> CallResult:
+        seen["timeout"] = options.timeout_seconds
+        return CallResult(True, "ok", None, 1, True, 0)
+
+    monkeypatch.setattr(hermes_plugin, "run_call", fake_run_call)
+    ns = argparse.Namespace(
+        version=False,
+        prompt="hello",
+        prompt_alias=None,
+        model=None,
+        ask=False,
+        cwd=None,
+        sandbox=False,
+        json=False,
+        timeout=None,
+        until_done=False,
+        max_iterations=8,
+        keep_session=False,
+        keep=False,
+        toolsets=None,
+        resume_session=None,
+        live=False,
+    )
+    assert hermes_plugin._handle_call_command(ns) == 0
+    assert seen["timeout"] == 600.0
+
+
+def test_plugin_preserves_explicit_finite_timeout(monkeypatch):
+    seen: dict[str, float] = {}
+
+    def fake_run_call(options: CallOptions) -> CallResult:
+        seen["timeout"] = options.timeout_seconds
+        return CallResult(True, "ok", None, 1, True, 0)
+
+    monkeypatch.setattr(hermes_plugin, "run_call", fake_run_call)
+    ns = argparse.Namespace(
+        version=False,
+        prompt="hello",
+        prompt_alias=None,
+        model=None,
+        ask=False,
+        cwd=None,
+        sandbox=False,
+        json=False,
+        timeout=42.5,
+        until_done=False,
+        max_iterations=8,
+        keep_session=False,
+        keep=False,
+        toolsets=None,
+        resume_session=None,
+        live=False,
+    )
+    assert hermes_plugin._handle_call_command(ns) == 0
+    assert seen["timeout"] == 42.5
+
+
+def test_plugin_doctor_rejects_nan_timeout_before_probes(monkeypatch):
+    monkeypatch.setattr(hermes_plugin, "framework_run_doctor", lambda **kw: pytest.fail("doctor probes must not start"))
+    monkeypatch.setattr(hermes_plugin, "live_checks", lambda t: pytest.fail("live checks must not start"))
+
+    ns = argparse.Namespace(
+        version=False,
+        prompt="doctor",
+        prompt_alias=None,
+        json=False,
+        live=True,
+        timeout=float("nan"),
+        ask=False,
+        toolsets=None,
+        until_done=False,
+        sandbox=False,
+    )
+    with pytest.raises(SystemExit) as exc:
+        hermes_plugin._handle_call_command(ns)
+    assert int(exc.value.code) == 2
+
+
+def test_slash_hermes_call_dash_returns_usage_not_stdin(monkeypatch):
+    class Ctx:
+        def __init__(self):
+            self.handlers = {}
+
+        def register_cli_command(self, *a, **k):
+            return None
+
+        def register_command(self, name, handler, **kwargs):
+            self.handlers[name] = handler
+
+    monkeypatch.setattr(hermes_plugin, "run_call", lambda options: pytest.fail("run_call must not start for '-'"))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("should-not-be-read"))
+
+    ctx = Ctx()
+    hermes_plugin.register(ctx)
+    result = ctx.handlers["hermes-call"]("-")
+    assert result == "Usage: /hermes-call <prompt>"
+
+
+def test_json_exposes_session_id_when_cleanup_failed():
+    result = CallResult(
+        ok=True,
+        answer="pong",
+        model="grok-4.3",
+        duration_ms=12,
+        session_cleaned=False,
+        exit_code=0,
+        session_cleanup_reason="delete_failed:boom",
+        session_id="20260612_120000_aaaa01",
+    )
+    payload = result.to_json_object()
+    assert payload["session_cleaned"] is False
+    assert payload["session_id"] == "20260612_120000_aaaa01"
+    assert "status" not in payload
+
+
+def test_json_successful_oneshot_shape_omits_session_id_even_if_known():
+    result = CallResult(
+        ok=True,
+        answer="pong",
+        model="grok-4.3",
+        duration_ms=12,
+        session_cleaned=True,
+        exit_code=0,
+        session_id="20260612_120000_aaaa01",
+    )
+    payload = result.to_json_object()
+    assert payload == {
+        "ok": True,
+        "answer": "pong",
+        "model": "grok-4.3",
+        "duration_ms": 12,
+        "session_cleaned": True,
+        "exit_code": 0,
+    }
+
+
+def test_json_includes_session_id_when_status_present():
+    result = CallResult(
+        ok=True,
+        answer="done",
+        model=None,
+        duration_ms=1,
+        session_cleaned=True,
+        exit_code=0,
+        session_id="20260612_120000_aaaa01",
+        status="complete",
+        iterations=1,
+    )
+    payload = result.to_json_object()
+    assert payload["status"] == "complete"
+    assert payload["session_id"] == "20260612_120000_aaaa01"
+
+
+def test_docs_cwd_match_ambiguous_no_started_at_tiebreak():
+    text = Path("docs/hermes-cli-contract.md").read_text(encoding="utf-8")
+    assert "cwd_match_ambiguous" in text
+    assert "no `started_at` tie-break" in text
+    assert "newest `started_at`" not in text
+    assert "started_at`/id tie-break" not in text
+
+
+def test_gc_ended_at_is_activity_not_immediate_delete(monkeypatch):
+    now = 1_000_000.0
+    recent_id = "20260612_120000_aa0001"
+    stale_id = "20260612_120000_bb0002"
+    deleted: list[str] = []
+
+    # Rich path: recent ended_at must be preserved; stale ended_at deleted.
+    rich = {
+        recent_id: {
+            "id": recent_id,
+            "source": "cli",
+            "title": None,
+            "ended_at": now - 30,
+            "last_active": now - 3600,
+        },
+        stale_id: {
+            "id": stale_id,
+            "source": "cli",
+            "title": None,
+            "ended_at": now - 1800,
+            "last_active": now - 3600,
+        },
+    }
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: rich)
+
+    def rich_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:3] == ["hermes", "sessions", "delete"]:
+            deleted.append(command[-1])
+            return _completed(command, stdout=f"Deleted session '{command[-1]}'.\n")
+        if command[:3] == ["hermes", "sessions", "optimize"]:
+            return _completed(command, stdout="optimized\n")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    rich_report = gc_sessions(dry_run=False, idle_minutes=10, runner=rich_runner, now=now)
+    assert recent_id in rich_report.skipped_recent_ids
+    assert stale_id in rich_report.deleted_ids
+    assert deleted == [stale_id]
+
+    # List/export path must make the same decisions.
+    deleted.clear()
+    monkeypatch.setattr("cluxion_hermes_call.sessions._load_rich_cli_sessions", lambda **kwargs: {})
+
+    def list_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+        if command[:4] == ["hermes", "sessions", "list", "--source"]:
+            return _completed(
+                command,
+                stdout=_gc_list_output(
+                    [
+                        {"id": recent_id, "last_active": "1h ago"},
+                        {"id": stale_id, "last_active": "1h ago"},
+                    ]
+                ),
+            )
+        if command[:3] == ["hermes", "sessions", "export"]:
+            sid = command[-1]
+            ended = now - 30 if sid == recent_id else now - 1800
+            return _completed(command, stdout=_gc_export_record(sid, ended_at=ended, last_message_at=now - 3600))
+        if command[:3] == ["hermes", "sessions", "delete"]:
+            deleted.append(command[-1])
+            return _completed(command, stdout=f"Deleted session '{command[-1]}'.\n")
+        if command[:3] == ["hermes", "sessions", "optimize"]:
+            return _completed(command, stdout="optimized\n")
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    list_report = gc_sessions(dry_run=False, idle_minutes=10, runner=list_runner, now=now)
+    assert recent_id in list_report.skipped_recent_ids
+    assert stale_id in list_report.deleted_ids
+    assert deleted == [stale_id]

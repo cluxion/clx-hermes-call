@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import TextIO
@@ -57,7 +58,12 @@ def add_call_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-C", "--cd", dest="cwd", help="Run hermes with this subprocess working directory")
     parser.add_argument("--sandbox", action="store_true", help="Run in a fresh ~/.cluxion_hermes job work directory")
     parser.add_argument("--json", action="store_true", help="Print one JSON result object to stdout")
-    parser.add_argument("--timeout", type=float, default=600.0, help="Timeout in seconds (default: 600)")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds (default: 600 for calls; doctor --live default: 120)",
+    )
     parser.add_argument("--until-done", action="store_true", help="Resume the owned Hermes session until TASK_COMPLETE")
     parser.add_argument("--max-iterations", type=int, default=8, help="Maximum --until-done turns (default: 8)")
     parser.add_argument("--keep-session", action="store_true", help="Skip session self-cleanup")
@@ -109,7 +115,12 @@ def build_doctor_parser(prog: str = "hermes-call doctor", *, json_errors: bool =
     parser = JsonArgumentParser(prog=prog, json_errors=json_errors)
     parser.add_argument("--json", action="store_true", help="Print framework JSON to stdout")
     parser.add_argument("--live", action="store_true", help="Run one tiny live --ask model round-trip")
-    parser.add_argument("--timeout", type=float, default=120.0, help="Live check timeout in seconds (default: 120)")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Live check timeout in seconds (default: 120)",
+    )
     parser.add_argument("-V", "--version", action="store_true", help="Show version and exit")
     return parser
 
@@ -167,10 +178,7 @@ def _main_doctor(argv: list[str]) -> int:
     parser = build_doctor_parser(json_errors="--json" in argv)
     try:
         ns = parser.parse_args(argv)
-        if ns.timeout <= 0:
-            parser.error("--timeout must be greater than 0")
-        if ns.timeout > MAX_TIMEOUT_SECONDS:
-            parser.error(f"--timeout must be at most {int(MAX_TIMEOUT_SECONDS)}")
+        timeout = _resolve_timeout(ns.timeout, default=120.0, parser=parser)
     except UsageError as exc:
         _write_error_json(error=exc.error, message=exc.message, hint=exc.hint, exit_code=2)
         return 2
@@ -194,7 +202,7 @@ def _main_doctor(argv: list[str]) -> int:
     )
 
     if ns.live:
-        live_results = live_checks(ns.timeout)
+        live_results = live_checks(timeout)
         result = DoctorResult(
             plugin=result.plugin,
             version=result.version,
@@ -241,10 +249,7 @@ def options_from_namespace(
 ) -> CallOptions:
     """Convert argparse state into validated core options."""
     prompt = _resolve_prompt(ns.prompt, ns.prompt_alias, stdin=stdin, parser=parser)
-    if ns.timeout <= 0:
-        parser.error("--timeout must be greater than 0")
-    if ns.timeout > MAX_TIMEOUT_SECONDS:
-        parser.error(f"--timeout must be at most {int(MAX_TIMEOUT_SECONDS)}")
+    timeout = _resolve_timeout(getattr(ns, "timeout", None), default=600.0, parser=parser)
     if ns.max_iterations <= 0:
         parser.error("--max-iterations must be greater than 0")
     if ns.keep and not ns.sandbox:
@@ -263,7 +268,7 @@ def options_from_namespace(
         cwd=cwd,
         sandbox=bool(ns.sandbox),
         json_mode=bool(ns.json),
-        timeout_seconds=float(ns.timeout),
+        timeout_seconds=timeout,
         keep_session=bool(ns.keep_session),
         keep_job=bool(ns.keep),
         toolsets=ns.toolsets,
@@ -272,6 +277,23 @@ def options_from_namespace(
         max_iterations=int(ns.max_iterations),
         resume_session=ns.resume_session,
     )
+
+
+def _resolve_timeout(
+    raw: float | None,
+    *,
+    default: float,
+    parser: argparse.ArgumentParser,
+) -> float:
+    """Apply branch-specific default, then reject non-finite / out-of-range values."""
+    timeout = default if raw is None else float(raw)
+    if not math.isfinite(timeout):
+        parser.error("--timeout must be a finite number within the supported range")
+    if timeout <= 0:
+        parser.error("--timeout must be greater than 0")
+    if timeout > MAX_TIMEOUT_SECONDS:
+        parser.error(f"--timeout must be at most {int(MAX_TIMEOUT_SECONDS)}")
+    return timeout
 
 
 def _resolve_prompt(

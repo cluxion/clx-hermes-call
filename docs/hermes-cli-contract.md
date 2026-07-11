@@ -26,7 +26,7 @@ Verified on 2026-06-14 against the local `hermes` binary on PATH. Re-check with
 - Default single-shot mode remains `hermes -z PROMPT`; `-m` is passed only when the caller provides it.
 - `-C/--cd` changes the subprocess cwd. The wrapper does not pass a cwd flag to Hermes.
 - `--until-done` is opt-in. It appends a completion contract requiring a final line of either `TASK_COMPLETE` or `WORK_REMAINS: ...`; parsing trims whitespace and ignores marker case on the final non-empty line only.
-- The first `--until-done` turn uses `hermes -z` for clean stdout. The created session is selected through the existing fail-closed session diff plus exported `cwd` match, then newest `started_at`/id tie-break when concurrent same-cwd candidates remain.
+- The first `--until-done` turn uses `hermes -z` for clean stdout. The created session is selected through the existing fail-closed session diff plus exported `cwd` match; multiple same-cwd candidates are refused as `cwd_match_ambiguous` (no `started_at` tie-break).
 - Continuation uses the verified local path `hermes chat -Q --resume <owned-id> -q ...`, not `hermes -r <id> -z ...`.
 - Cleanup is still fail-closed: only the selected owned session id is deleted, and `--keep-session` preserves it.
 - If `hermes sessions list` fails during `gc --sessions`, `hermes-call` prints the failure on stderr, prints the zero-delete summary, and exits 2 in both dry-run and `--apply`.

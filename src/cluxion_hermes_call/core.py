@@ -11,6 +11,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,7 @@ SECRET_PATTERNS = [
 MAX_PROMPT_BYTES = 256 * 1024
 MAX_TIMEOUT_SECONDS = 86_400.0
 _KILL_DRAIN_TIMEOUT_SECONDS = 0.5
+_TERM_POLL_TIMEOUT_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -121,7 +123,9 @@ class CallResult:
             payload["status"] = self.status
         if self.iterations is not None:
             payload["iterations"] = self.iterations
-        if self.status is not None and self.session_id is not None:
+        # Expose session_id for until-done status or failed cleanup; never for
+        # a successful one-shot solely because cleanup happened to know the id.
+        if self.session_id is not None and (self.status is not None or not self.session_cleaned):
             payload["session_id"] = self.session_id
         if self.work_log:
             payload["work_log"] = list(self.work_log)
@@ -644,7 +648,10 @@ def _until_done_exit_code(*, status: str, process_result: HermesProcessResult) -
 
 
 _live_processes: set[int] = set()
-_signal_hooks_installed = False
+_live_processes_lock = threading.RLock()
+_atexit_registered = False
+_installed_signal_hooks: set[int] = set()
+_signal_cleanup_active = False
 
 
 def _register_child(pid: int) -> None:
@@ -653,40 +660,134 @@ def _register_child(pid: int) -> None:
     start_new_session=True detaches hermes from our signals on purpose (we
     manage its lifetime), which also means Ctrl-C on hermes-call alone would
     leave the group running forever. SIGINT/SIGTERM/atexit now reap it.
+
+    Track installed signums separately: a transient failure on one signal must
+    not prevent later registrations from installing the other. atexit is still
+    registered once.
     """
-    global _signal_hooks_installed
-    _live_processes.add(pid)
-    if _signal_hooks_installed:
+    global _atexit_registered
+    with _live_processes_lock:
+        _live_processes.add(pid)
+        if not _atexit_registered:
+            atexit.register(_reap_live_processes)
+            _atexit_registered = True
+        missing = [signum for signum in (signal.SIGINT, signal.SIGTERM) if signum not in _installed_signal_hooks]
+    if not missing:
         return
-    _signal_hooks_installed = True
-    atexit.register(_reap_live_processes)
-    for signum in (signal.SIGINT, signal.SIGTERM):
+
+    for signum in missing:
         previous = signal.getsignal(signum)
 
         def _handler(signo: int, frame: object, _previous=previous) -> None:
-            _reap_live_processes()
+            # Only the cleanup owner may propagate/default the signal.
+            # A nested reentry during TERM grace returns False and must not
+            # kill the parent before the owner finishes KILL/reap.
+            if not _reap_live_processes():
+                return
             if callable(_previous):
                 _previous(signo, frame)
+            elif _previous == signal.SIG_IGN:
+                return
             else:
                 signal.signal(signo, signal.SIG_DFL)
                 os.kill(os.getpid(), signo)
 
-        # Non-main thread or exotic host: atexit still covers normal exits.
-        with contextlib.suppress(ValueError, OSError):
+        try:
             signal.signal(signum, _handler)
+        except (ValueError, OSError):
+            continue
+        with _live_processes_lock:
+            _installed_signal_hooks.add(signum)
 
 
 def _unregister_child(pid: int) -> None:
-    _live_processes.discard(pid)
+    with _live_processes_lock:
+        _live_processes.discard(pid)
 
 
-def _reap_live_processes() -> None:
-    for pid in sorted(_live_processes):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            continue
-    _live_processes.clear()
+def _reap_live_processes() -> bool:
+    """TERM one snapshot with a single global grace window, then KILL + drain.
+
+    Returns False only when cleanup is already active (reentrant nested call).
+    Returns True for the owner on every normal path, including an empty snapshot.
+    Never clears PIDs registered after the snapshot was taken. No per-child waits.
+    """
+    global _signal_cleanup_active
+    with _live_processes_lock:
+        if _signal_cleanup_active:
+            return False
+        _signal_cleanup_active = True
+        snapshot = set(_live_processes)
+    try:
+        if not snapshot:
+            return True
+        for pid in snapshot:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(pid, signal.SIGTERM)
+
+        term_deadline = time.monotonic() + _TERM_POLL_TIMEOUT_SECONDS
+        survivors = set(snapshot)
+        while survivors and time.monotonic() < term_deadline:
+            survivors = {pid for pid in survivors if _process_group_alive(pid)}
+            if not survivors:
+                break
+            time.sleep(0.01)
+        survivors = {pid for pid in survivors if _process_group_alive(pid)}
+
+        for pid in survivors:
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.killpg(pid, signal.SIGKILL)
+
+        drain_deadline = time.monotonic() + _KILL_DRAIN_TIMEOUT_SECONDS
+        pending = set(snapshot)
+        while pending and time.monotonic() < drain_deadline:
+            for pid in list(pending):
+                reaped = False
+                try:
+                    waited, _status = os.waitpid(pid, os.WNOHANG)
+                    if waited == pid:
+                        reaped = True
+                except ChildProcessError:
+                    reaped = True
+                except ProcessLookupError:
+                    reaped = True
+                except OSError:
+                    reaped = not _pid_alive(pid)
+                if reaped or not _pid_alive(pid):
+                    pending.discard(pid)
+            if pending:
+                time.sleep(0.01)
+
+        with _live_processes_lock:
+            _live_processes.difference_update(snapshot)
+        return True
+    finally:
+        with _live_processes_lock:
+            _signal_cleanup_active = False
+
+
+def _process_group_alive(pid: int) -> bool:
+    try:
+        os.killpg(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return _pid_alive(pid)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def _termination_grace(timeout_seconds: float) -> float:
