@@ -23,6 +23,7 @@ from cluxion_hermes_call.sessions import (
     capture_session_ids,
     cleanup_created_session,
     delete_session,
+    fetch_session_metadata,
     identify_created_session,
 )
 
@@ -225,6 +226,30 @@ def validate_call_options(options: CallOptions) -> CallResult | None:
             message="--max-iterations must be greater than 0.",
             hint="Use a positive integer.",
         )
+    if options.resume_session is not None:
+        if (
+            not isinstance(options.resume_session, str)
+            or not options.resume_session
+            or any(character.isspace() for character in options.resume_session)
+            or "\0" in options.resume_session
+        ):
+            return _structured_error_result(
+                error="invalid_resume_session",
+                message="--resume must be a non-empty session ID without whitespace or null bytes.",
+                hint="Copy the exact ID from `hermes sessions list`.",
+            )
+        if options.sandbox:
+            return _structured_error_result(
+                error="resume_sandbox_conflict",
+                message="--resume cannot be combined with a new sandbox workspace.",
+                hint="Resume from the session's original project directory without --sandbox.",
+            )
+        if options.until_done:
+            return _structured_error_result(
+                error="resume_until_done_conflict",
+                message="--resume cannot be combined with --until-done.",
+                hint="Use --resume for one existing session or --until-done to let the caller own a new session.",
+            )
     if options.cwd is not None and "\0" in str(options.cwd):
         return _structured_error_result(
             error="invalid_cwd",
@@ -257,6 +282,40 @@ def _resolve_call_cwd(cwd: Path | None) -> Path | CallResult:
     )
 
 
+def _resume_owner_error(options: CallOptions, cwd: Path) -> CallResult | None:
+    """Fail closed unless exported resume metadata owns the requested cwd."""
+    if options.resume_session is None:
+        return None
+    metadata = fetch_session_metadata(options.resume_session, hermes_bin=options.hermes_bin)
+    if metadata.error is not None or metadata.cwd is None:
+        return _structured_error_result(
+            error="resume_owner_unknown",
+            message="The resumed session's project directory could not be verified.",
+            hint="Verify the session still exists and its original project directory is available.",
+        )
+    try:
+        owner_cwd = Path(metadata.cwd).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return _structured_error_result(
+            error="resume_owner_unknown",
+            message="The resumed session's original project directory is unavailable.",
+            hint="Restore the original directory or start a new session in this project.",
+        )
+    if not owner_cwd.is_dir():
+        return _structured_error_result(
+            error="resume_owner_unknown",
+            message="The resumed session's original project path is not a directory.",
+            hint="Restore the original directory or start a new session in this project.",
+        )
+    if owner_cwd != cwd:
+        return _structured_error_result(
+            error="resume_owner_mismatch",
+            message="The resumed session belongs to a different project directory.",
+            hint="Run from the exported session directory or start a new session here.",
+        )
+    return None
+
+
 def run_call(options: CallOptions) -> CallResult:
     """Run Hermes once, clean up its session and sandbox when safe."""
     validation_error = validate_call_options(options)
@@ -279,6 +338,10 @@ def run_call(options: CallOptions) -> CallResult:
     if isinstance(resolved, CallResult):
         return resolved
     cwd = resolved
+
+    resume_error = _resume_owner_error(options, cwd)
+    if resume_error is not None:
+        return resume_error
 
     # A resumed session belongs to the user; hermes-call must never GC it.
     owns_session = not options.keep_session and options.resume_session is None
